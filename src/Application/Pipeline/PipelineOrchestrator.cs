@@ -42,17 +42,17 @@ internal sealed class PipelineOrchestrator
         if (!Directory.Exists(sqlDirectory))
             throw new DirectoryNotFoundException($"SQL source directory not found: '{sqlDirectory}'");
 
-        var sqlFiles = Directory.GetFiles(sqlDirectory, "*.sql", SearchOption.AllDirectories)
+        var sqlFiles = Directory.GetFiles(sqlDirectory, "*.sp", SearchOption.AllDirectories)
                                 .OrderBy(f => f)
                                 .ToArray();
 
         if (sqlFiles.Length == 0)
         {
-            _logger.LogWarning("No .sql files found in '{Directory}'.", sqlDirectory);
+            _logger.LogWarning("No .sp files found in '{Directory}'.", sqlDirectory);
             return;
         }
 
-        _logger.LogInformation("Discovered {Total} SQL files in '{Directory}'.", sqlFiles.Length, sqlDirectory);
+        _logger.LogInformation("Discovered {Total} stored procedure files in '{Directory}'.", sqlFiles.Length, sqlDirectory);
 
         await _checkpoint.LoadAsync(cancellationToken);
 
