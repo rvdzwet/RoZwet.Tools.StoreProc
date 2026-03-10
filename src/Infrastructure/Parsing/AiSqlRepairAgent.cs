@@ -80,9 +80,9 @@ internal sealed class AiSqlRepairAgent
 
         try
         {
-            _logger.LogDebug(
-                "Invoking AI SQL repair. Error count: {Count}. First: {First}",
-                parseErrors.Count, parseErrors[0].Message);
+            _logger.LogInformation(
+                "AI repair invoked: {Count} error(s). Errors: [{Errors}]",
+                parseErrors.Count, errorSummary);
 
             var repaired = await _chatProvider.CompleteAsync(
                 RepairSystemPrompt, userPrompt, cancellationToken);
@@ -91,16 +91,19 @@ internal sealed class AiSqlRepairAgent
 
             if (string.IsNullOrWhiteSpace(repaired))
             {
-                _logger.LogDebug("AI repair returned an empty response.");
+                _logger.LogWarning("AI repair returned an empty response. Errors were: [{Errors}]", errorSummary);
                 return null;
             }
 
-            _logger.LogDebug("AI repair succeeded. Repaired SQL length: {Len}.", repaired.Length);
+            _logger.LogInformation(
+                "AI repair response received. Input SQL: {InputLen} chars → Output SQL: {OutputLen} chars.",
+                sql.Length, repaired.Length);
+
             return repaired;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "AI SQL repair call failed.");
+            _logger.LogWarning(ex, "AI repair call threw an exception. Errors were: [{Errors}]", errorSummary);
             return null;
         }
     }

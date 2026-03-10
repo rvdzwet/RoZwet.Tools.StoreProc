@@ -86,9 +86,9 @@ internal sealed class SqlAnalysisAgent
 
         if (errors.Count > 0)
         {
-            _logger.LogDebug(
-                "Tier-1 parse errors in '{FilePath}': {Count} error(s). Invoking AI repair.",
-                filePath, errors.Count);
+            _logger.LogInformation(
+                "Tier-1 preprocessor left {Count} parse error(s) in '{FilePath}'. First: {First}. Escalating to AI repair.",
+                errors.Count, filePath, errors[0].Message);
 
             var repairedSql = await _repairAgent.RepairAsync(normalizedSql, errors, cancellationToken);
 
@@ -100,7 +100,7 @@ internal sealed class SqlAnalysisAgent
                 if (repairedErrors.Count == 0)
                 {
                     _logger.LogInformation(
-                        "AI repair succeeded for '{FilePath}'. Proceeding with repaired AST.",
+                        "AI repair succeeded for '{FilePath}': all parse errors resolved. Proceeding with repaired AST.",
                         filePath);
                     fragment = repairedFragment;
                     errors = repairedErrors;
@@ -108,14 +108,15 @@ internal sealed class SqlAnalysisAgent
                 else
                 {
                     _logger.LogWarning(
-                        "AI repair did not resolve all errors in '{FilePath}': {Count} error(s) remain. First: {First}",
-                        filePath, repairedErrors.Count, repairedErrors[0].Message);
+                        "AI repair for '{FilePath}' reduced errors from {Before} to {After}. Remaining: {First}. Proceeding with best-effort AST.",
+                        filePath, errors.Count, repairedErrors.Count, repairedErrors[0].Message);
+                    fragment = repairedFragment;
                 }
             }
             else
             {
                 _logger.LogWarning(
-                    "Parse errors in '{FilePath}': {ErrorCount} error(s). First: {FirstError}",
+                    "AI repair unavailable for '{FilePath}'. Original {Count} parse error(s) remain. First: {First}. Proceeding with partial AST.",
                     filePath, errors.Count, errors[0].Message);
             }
         }
