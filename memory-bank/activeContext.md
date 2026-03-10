@@ -5,37 +5,25 @@ All planned features through v1.7.0 are implemented and building clean (0 errors
 
 ## Completed Milestones
 
-### v1.7.0 — MCP stdio Server
-- Added `ModelContextProtocol` 1.1.0 NuGet package to `RoZwet.Tools.StoreProc.csproj`.
+### v1.7.0 — MCP HTTP Server
+- Replaced `ModelContextProtocol` with `ModelContextProtocol.AspNetCore` 1.1.0.
+- Added `<FrameworkReference Include="Microsoft.AspNetCore.App" />` (provides Hosting, Configuration.Json, Logging.Console transitively — explicit package refs removed).
 - New file: `src/Application/McpServer/StoreProcTools.cs`
   - `[McpServerToolType]` class; DI-injected via `HybridSearchService` + `INeo4jRepository`.
   - Four tools: `SearchProcedures`, `GetProcedureSql`, `ExpandCallChain`, `GetTableUsage`.
   - All `[McpServerTool]` + `[Description]` attributes for schema discovery by MCP clients.
 - `Program.cs` updated:
-  - New `--mcp` mode added to valid args.
-  - `RunMcpAsync()` builds an independent `HostApplicationBuilder` with all logging routed to stderr.
-  - `WithStdioServerTransport()` + `WithToolsFromAssembly(typeof(StoreProcTools).Assembly)`.
-  - `PrintUsage()` updated to show the new `--mcp` flag.
+  - New `--mcp` mode; `RunMcpAsync()` uses `WebApplication.CreateBuilder()`.
+  - `WithHttpTransport()` + `app.MapMcp()` + `app.RunAsync(url)`.
+  - URL configured via `appsettings.json` key `Mcp:Url` (default `http://localhost:3001`).
+- `appsettings.json`: added `"Mcp": { "Url": "http://localhost:3001" }`.
+- `cline_mcp_settings.json`: added `storedproc-graphrag` with `"url": "http://localhost:3001/mcp"` + all four tools auto-approved.
 - Version bumped to 1.7.0.
 
 ### Cline Integration
-Add this to your Cline MCP settings:
-```json
-{
-  "mcpServers": {
-    "storedproc-graphrag": {
-      "command": "dotnet",
-      "args": [
-        "run",
-        "--project",
-        "c:\\Users\\roman\\source\\repos\\RoZwet.Tools.StoreProc\\RoZwet.Tools.StoreProc.csproj",
-        "--",
-        "--mcp"
-      ]
-    }
-  }
-}
-```
+The `cline_mcp_settings.json` has been updated automatically. To use the tools:
+1. Start the server: `dotnet run --project "c:\Users\roman\source\repos\RoZwet.Tools.StoreProc\RoZwet.Tools.StoreProc.csproj" -- --mcp`
+2. Cline will connect automatically via `http://localhost:3001/mcp`.
 
 ### v1.6.0 — Fire-and-Forget Background AI Repair
 - `SqlAnalysisAgent` refactored into three focused methods:

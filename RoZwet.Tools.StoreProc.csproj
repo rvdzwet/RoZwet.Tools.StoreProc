@@ -13,19 +13,21 @@
     <Version>1.7.0</Version>
   </PropertyGroup>
 
+  <!-- ASP.NET Core framework — required for WebApplication / HTTP transport -->
   <ItemGroup>
-    <!-- Hosting and DI -->
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.2" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.2" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.2" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
 
+  <ItemGroup>
     <!-- Microsoft.Extensions.AI — core interfaces -->
+    <!-- Note: Hosting, Configuration.Json, and Logging.Console are
+         provided transitively by Microsoft.AspNetCore.App above. -->
     <PackageReference Include="Microsoft.Extensions.AI" Version="9.5.0" />
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.3.0" />
 
     <!-- T-SQL AST parsing -->
     <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="170.3.0" />
-    <PackageReference Include="ModelContextProtocol" Version="1.1.0" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.1.0" />
     <PackageReference Include="Mscc.GenerativeAI.Microsoft" Version="3.1.0" />
 
     <!-- Neo4j Bolt driver -->

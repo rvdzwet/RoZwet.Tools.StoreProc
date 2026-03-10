@@ -182,13 +182,14 @@ OPTIONS { indexConfig: { `vector.dimensions`: 1024, `vector.similarity_function`
 ## 8. MCP SERVER (v1.7.0)
 
 ### Transport
-stdio (JSON-RPC 2.0 over stdin/stdout) — the standard transport for Cline and Claude Desktop.
-All logging is routed to **stderr** only; stdout is reserved for MCP protocol frames.
+HTTP (JSON-RPC 2.0 over HTTP/SSE via `ModelContextProtocol.AspNetCore`) — network-accessible, compatible with Cline and any MCP HTTP client.
 
 ### Activation
 ```
 RoZwet.Tools.StoreProc --mcp
 ```
+Listens on `Mcp:Url` from `appsettings.json` (default `http://localhost:3001`).
+MCP endpoint: `http://localhost:3001/mcp`
 
 ### Registered Tools (`src/Application/McpServer/StoreProcTools.cs`)
 
@@ -199,30 +200,25 @@ RoZwet.Tools.StoreProc --mcp
 | `ExpandCallChain` | `name: string`, `depth: int (1–5)` | `INeo4jRepository.ExpandCallChainAsync` |
 | `GetTableUsage` | `tableName: string` | `INeo4jRepository.GetTableUsageAsync` |
 
-### Cline Integration (`cline_mcp_settings.json`)
+### Cline Integration (`cline_mcp_settings.json` — already configured)
 ```json
 {
   "mcpServers": {
     "storedproc-graphrag": {
-      "command": "dotnet",
-      "args": [
-        "run",
-        "--project",
-        "c:\\Users\\roman\\source\\repos\\RoZwet.Tools.StoreProc\\RoZwet.Tools.StoreProc.csproj",
-        "--",
-        "--mcp"
-      ]
+      "url": "http://localhost:3001/mcp",
+      "disabled": false,
+      "autoApprove": ["SearchProcedures", "GetProcedureSql", "ExpandCallChain", "GetTableUsage"]
     }
   }
 }
 ```
 
 ### Design Notes
+- Package: `ModelContextProtocol.AspNetCore` 1.1.0; `FrameworkReference Microsoft.AspNetCore.App` replaces the three explicit hosting packages.
 - `[McpServerToolType]` / `[McpServerTool]` attributes drive discovery via `WithToolsFromAssembly`.
 - `StoreProcTools` is an `internal sealed` DI-injected class — constructor receives `HybridSearchService` + `INeo4jRepository`.
-- The `--mcp` host is built with `Host.CreateApplicationBuilder()` independently of the existing `BuildHost()` to guarantee stderr-only logging.
+- `RunMcpAsync()` uses `WebApplication.CreateBuilder()` → `WithHttpTransport()` → `app.MapMcp()` → `app.RunAsync(url)`.
 - `IChatClient` and `ChatService` are registered but never resolved in MCP mode — factories are lazy, no Gemini calls occur.
-- No authentication — stdio transport is local-process-only by design.
 
 ---
 

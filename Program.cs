@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.AI;
+﻿using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -59,21 +60,16 @@ internal static class Program
     }
 
     // -------------------------------------------------------------------------
-    // MCP stdio server — all application output MUST go to stderr.
-    // stdout is reserved exclusively for the JSON-RPC framing.
+    // MCP HTTP server — listens on Mcp:Url (default http://localhost:3001).
+    // Connect Cline via: { "url": "http://localhost:3001/mcp" }
     // -------------------------------------------------------------------------
     private static async Task<int> RunMcpAsync()
     {
-        var builder = Host.CreateApplicationBuilder();
+        var builder = WebApplication.CreateBuilder();
 
         builder.Configuration
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
             .AddEnvironmentVariables(prefix: "ROZWET_");
-
-        // Redirect every log line to stderr so stdout stays clean for MCP frames.
-        builder.Logging.ClearProviders();
-        builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
-        builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
         var config = builder.Configuration;
 
@@ -83,10 +79,14 @@ internal static class Program
 
         builder.Services
             .AddMcpServer()
-            .WithStdioServerTransport()
+            .WithHttpTransport()
             .WithToolsFromAssembly(typeof(StoreProcTools).Assembly);
 
-        await builder.Build().RunAsync();
+        var app = builder.Build();
+        app.MapMcp();
+
+        var url = config["Mcp:Url"] ?? "http://localhost:3001";
+        await app.RunAsync(url);
         return 0;
     }
 
@@ -293,6 +293,6 @@ internal static class Program
         Console.WriteLine("Usage:");
         Console.WriteLine("  RoZwet.Tools.StoreProc --ingest   Run the ingestion pipeline");
         Console.WriteLine("  RoZwet.Tools.StoreProc --chat     Start the interactive chat session");
-        Console.WriteLine("  RoZwet.Tools.StoreProc --mcp      Start the MCP stdio server");
+        Console.WriteLine("  RoZwet.Tools.StoreProc --mcp      Start the MCP HTTP server (default: http://localhost:3001)");
     }
 }
