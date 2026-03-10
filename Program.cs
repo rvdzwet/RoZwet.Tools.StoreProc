@@ -72,6 +72,7 @@ internal static class Program
 
         var app = builder.Build();
 
+        app.UseDefaultFiles();   // maps GET / → /index.html
         app.UseStaticFiles();
 
         var expectedToken = ComputeSessionToken(RequireConfig(config, "Web:AccessPassword"));
