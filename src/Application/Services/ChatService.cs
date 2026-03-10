@@ -163,17 +163,16 @@ internal sealed class ChatService
         {
             foreach (var content in update.Contents)
             {
-                string? text = content switch
+                switch (content)
                 {
-                    TextContent tc      => tc.Text,
-                    _                   => null
-                };
+                    case TextReasoningContent rc when rc.Text is { Length: > 0 }:
+                        onChunk(true, rc.Text);
+                        break;
 
-                if (text is null || text.Length == 0)
-                    continue;
-
-                bool isReasoning = content is not TextContent;
-                onChunk(isReasoning, text);
+                    case TextContent tc when tc.Text is { Length: > 0 }:
+                        onChunk(false, tc.Text);
+                        break;
+                }
             }
         }
     }
