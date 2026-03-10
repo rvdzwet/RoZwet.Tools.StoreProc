@@ -23,6 +23,15 @@ public interface INeo4jRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Returns the stored SHA-256 content hash for a procedure by its exact name.
+    /// Returns <see langword="null"/> when the procedure does not exist in the graph.
+    /// Used by the ingestion pipeline for incremental change detection.
+    /// </summary>
+    Task<string?> GetContentHashAsync(
+        string name,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Performs a vector similarity search over the procedure_embeddings index.
     /// Returns the top <paramref name="topK"/> nearest procedures by cosine similarity.
     /// </summary>
@@ -48,10 +57,21 @@ public interface INeo4jRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Traverses CALLS relationships up to <paramref name="depth"/> hops and returns
-    /// the distinct names of all procedures reachable from <paramref name="name"/>.
+    /// Traverses CALLS relationships outward from <paramref name="name"/> up to
+    /// <paramref name="depth"/> hops and returns the distinct names of all
+    /// procedures reachable from that root (callees).
     /// </summary>
     Task<IReadOnlyList<string>> ExpandCallChainAsync(
+        string name,
+        int depth,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Traverses CALLS relationships inward toward <paramref name="name"/> up to
+    /// <paramref name="depth"/> hops and returns the distinct names of all
+    /// procedures that eventually call the given procedure (callers).
+    /// </summary>
+    Task<IReadOnlyList<string>> GetCallerChainAsync(
         string name,
         int depth,
         CancellationToken cancellationToken = default);
@@ -63,9 +83,36 @@ public interface INeo4jRepository
     Task<IReadOnlyList<string>> GetTableUsageAsync(
         string tableName,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns the names of all procedures coupled to <paramref name="procedureName"/>
+    /// via SHARES_TABLE_WITH relationships — meaning they read from a table that the
+    /// given procedure writes to, or vice versa.
+    /// </summary>
+    Task<IReadOnlyList<SharedTableProcedure>> GetSharedTableProceduresAsync(
+        string procedureName,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns all procedures that declare at least one parameter whose SQL data type
+    /// matches <paramref name="dataType"/> (case-insensitive prefix match).
+    /// </summary>
+    Task<IReadOnlyList<ParameterMatch>> FindProceduresByParameterTypeAsync(
+        string dataType,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
 /// Result record from a vector similarity search query.
 /// </summary>
 public sealed record SearchResult(string Name, string Schema, string Sql, double Score);
+
+/// <summary>
+/// Result record from a shared-table coupling query.
+/// </summary>
+public sealed record SharedTableProcedure(string ProcedureName, string SharedTableName);
+
+/// <summary>
+/// Result record from a parameter-type search query.
+/// </summary>
+public sealed record ParameterMatch(string ProcedureName, string ParameterName, string DataType);

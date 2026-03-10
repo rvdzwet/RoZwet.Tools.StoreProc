@@ -8,13 +8,15 @@
 
 `RoZwet.Tools.StoreProc` processes `.sp` files containing Sybase stored-procedure SQL through a two-tier resilient parse pipeline, enriches each procedure with a 1024-dimensional semantic vector embedding, and persists the result as a rich dependency graph in Neo4j.
 
+The ingestion pipeline is **incremental by design** — each daily run computes a SHA-256 hash of every source file and skips any procedure whose content has not changed since the last run. Only new or modified procedures consume AI embedding credits.
+
 Once ingested, the knowledge base is queryable through three surfaces:
 
 | Surface | Command | Description |
 |---|---|---|
 | **AG-UI web chat** | `--web` (default) | Browser-based chat UI; protected by password-gated session cookie |
 | **MCP server** | `--mcp` | HTTP Model Context Protocol server; any MCP client (Cline, Claude Desktop) can call the tools |
-| **Ingestion pipeline** | `--ingest` | Durable, resumable batch ingestion with checkpoint |
+| **Ingestion pipeline** | `--ingest` | Incremental, durable ingestion with content-hash change detection |
 
 ---
 
@@ -24,22 +26,26 @@ Once ingested, the knowledge base is queryable through three surfaces:
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ENTRY POINT  Program.cs                                             │
 │    ├── (default / --web)  →  AG-UI ASP.NET Core web server           │
-│    ├── --ingest           →  PipelineOrchestrator (durable, resumable)│
+│    ├── --ingest           →  PipelineOrchestrator (incremental)       │
 │    └── --mcp              →  MCP HTTP server (ModelContextProtocol)   │
 ├─────────────────────────────┬────────────────────────────────────────┤
 │  DOMAIN                     │  Clean-architecture aggregate root      │
-│  • StoredProcedure          │  name, schema, sql, embedding           │
+│  • StoredProcedure          │  name, schema, sql, contentHash,        │
+│                             │  embedding                              │
 │  • ProcedureCall            │  value object — callee name + schema    │
 │  • TableDependency          │  value object — table name + access type│
+│  • ProcedureParameter       │  value object — name, dataType,         │
+│                             │  isOutput, hasDefault                   │
 ├─────────────────────────────┴────────────────────────────────────────┤
 │  APPLICATION                                                         │
-│  • SqlAnalysisAgent       Two-tier parse + embedding agent           │
-│  • PipelineOrchestrator   Durable ingestion loop; checkpoint-aware   │
-│  • IngestionCheckpoint    Atomic JSON checkpoint (temp-file rename)  │
+│  • SqlAnalysisAgent       Two-tier parse + embedding agent;          │
+│                           SHA-256 hash computation; parameter extract│
+│  • PipelineOrchestrator   Incremental ingestion; hash-based skip     │
+│  • IngestionCheckpoint    Hash-map checkpoint (path → SHA-256)       │
 │  • HybridSearchService    Dutch-translation → vector → 1-hop expand  │
 │  • ChatService            Agentic MaxToolRounds loop (non-web path)  │
-│  • GraphQueryTools        4 AIFunction tools for the AG-UI agent     │
-│  • StoreProcTools         4 McpServerTool definitions for MCP mode   │
+│  • GraphQueryTools        7 AIFunction tools for the AG-UI agent     │
+│  • StoreProcTools         7 McpServerTool definitions for MCP mode   │
 ├──────────────────────────────────────────────────────────────────────┤
 │  INFRASTRUCTURE                                                      │
 │  • LegacySqlPreprocessor  8-rule regex normaliser for Sybase syntax  │
@@ -91,7 +97,6 @@ cp appsettings.template.json appsettings.json
   },
   "Ai": {
     "Chat": {
-      "Endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/",
       "ApiKey": "<your-gemini-api-key>",
       "Model": "gemini-3-flash-preview"
     },
@@ -102,7 +107,7 @@ cp appsettings.template.json appsettings.json
       "Dimensions": 1024
     },
     "Agent": {
-      "MaxToolRounds": 5
+      "MaxToolRounds": 50
     },
     "Resilience": {
       "MaxRetries": 6,
@@ -113,8 +118,7 @@ cp appsettings.template.json appsettings.json
   "Ingestion": {
     "SqlSourceDirectory": "./sp",
     "CheckpointFile": "./checkpoint.json",
-    "BatchSize": 50,
-    "MaxConcurrency": 4
+    "BatchSize": 50
   },
   "Mcp": {
     "Url": "http://localhost:3001"
@@ -140,7 +144,7 @@ Environment variables prefixed with `ROZWET_` override any key (e.g. `ROZWET_Neo
 | `Ai:Embedding:ApiKey` | — | Voyage AI API key |
 | `Ai:Embedding:Model` | `voyage-4-large` | Embedding model |
 | `Ai:Embedding:Dimensions` | `1024` | Vector dimensions — must match the Neo4j vector index |
-| `Ai:Agent:MaxToolRounds` | `5` | Max tool-calling rounds per chat turn before forcing a final answer |
+| `Ai:Agent:MaxToolRounds` | `50` | Max tool-calling rounds per chat turn before forcing a final answer |
 | `Ai:Resilience:MaxRetries` | `6` | Polly retry attempts on HTTP 429 / network failure |
 | `Ai:Resilience:BaseDelaySeconds` | `2.0` | Exponential back-off base delay |
 | `Ai:Resilience:MaxDelaySeconds` | `60.0` | Upper bound on retry delay |
@@ -191,13 +195,15 @@ dotnet run -- --ingest
 The pipeline:
 
 1. Discovers all `.sp` files recursively, sorted by path.
-2. Loads the durable checkpoint — resumes from the last committed index if interrupted.
-3. Retries any previously-failed files (both Tier-1 and Tier-2 are attempted on retry).
+2. Loads the durable checkpoint — computes SHA-256 hashes and skips unchanged files.
+3. Retries any previously-failed files (both Tier-1 and Tier-2 attempted on retry).
 4. **Tier 1 (fast path):** `LegacySqlPreprocessor` normalises each file with 8 deterministic regex rules, then `TSql160Parser` parses the AST. Successful files are embedding-enriched and batched to Neo4j.
 5. **Tier 2 (background repair):** Files that still have parse errors after Tier-1 are dispatched as fire-and-forget background tasks. `AiSqlRepairAgent` iteratively sends the SQL and parser errors to the Gemini model (up to 10 rounds) until the AST is clean, then upserts the result and clears the failure from the checkpoint.
 6. Saves an atomic checkpoint (temp-file rename) after every committed batch.
 
-Press **Ctrl+C** to interrupt safely — the next `--ingest` run resumes automatically.
+Press **Ctrl+C** to interrupt safely — the next `--ingest` run resumes automatically, skipping anything unchanged.
+
+> **Daily scheduling:** Because ingestion is content-hash based, it is safe to run on a daily schedule (Windows Task Scheduler, cron, CI pipeline). Only modified or new procedures are re-processed.
 
 ### 5. Start the web chat
 
@@ -221,6 +227,18 @@ The MCP server listens on `Mcp:Url` (default `http://localhost:3001`) using the 
 
 ## Ingestion Pipeline Detail
 
+### Incremental change detection
+
+Every source file is hashed with SHA-256 before parsing. The checkpoint stores a `processedFiles` map of `{ filePath → SHA-256 hex }`. On each run:
+
+- **Hash matches stored value** → file skipped entirely (no parse, no embed, no Neo4j write).
+- **Hash differs or file is new** → full parse + embed + upsert cycle runs.
+- **Previously failed files** → always retried regardless of hash.
+
+This makes daily runs cheap — typically only a small fraction of the corpus changes between runs.
+
+> **Migration note:** Checkpoints from v1.x used a sequential `lastCommittedIndex` format. The v2 pipeline auto-detects the old format and resets to a full re-ingest on the first run, then switches to hash-map tracking thereafter.
+
 ### Two-tier parse resilience
 
 | Tier | Path | Mechanism | Speed |
@@ -228,7 +246,7 @@ The MCP server listens on `Mcp:Url` (default `http://localhost:3001`) using the 
 | Tier 1 | Synchronous (main loop) | `LegacySqlPreprocessor` → `TSql160Parser` → `StoredProcedureVisitor` | Memory-speed |
 | Tier 2 | Background fire-and-forget | `AiSqlRepairAgent` → up to 10 LLM repair rounds → re-parse | Network-bound |
 
-Files that fail both tiers are persisted in `FailedFiles` inside the checkpoint JSON and retried on the next `--ingest` run.
+Files that fail both tiers are persisted in `failedFiles` inside the checkpoint JSON and retried on the next `--ingest` run.
 
 ### LegacySqlPreprocessor transformations
 
@@ -243,27 +261,110 @@ Applies eight deterministic regex transforms for Sybase-to-T-SQL incompatibiliti
 7. **SET PROCID ON|OFF** — Sybase-only statement stripped
 8. **Sybase multi-assignment SET** — `SET @a = e1, @b = e2` → `SELECT @a = e1, @b = e2`
 
-### Durable checkpoint
+### Durable checkpoint format (v2)
 
-`IngestionCheckpoint` persists two orthogonal dimensions of state:
-
-- `LastCommittedIndex` — sequential scan cursor (which file index was last flushed to Neo4j).
-- `FailedFiles` — set of file paths that could not be processed; retried on the next run.
+```json
+{
+  "lastRunUtc": "2026-03-10T22:00:00Z",
+  "processedFiles": {
+    "C:\\SP\\sp\\usp_GetOrder.sp": "a3f4b2c1...",
+    "C:\\SP\\sp\\usp_CreateInvoice.sp": "88c1d0e5..."
+  },
+  "failedFiles": [
+    "C:\\SP\\sp\\usp_Legacy.sp"
+  ]
+}
+```
 
 Writes are atomic: the JSON is serialised to a `.tmp` file then renamed over the target, preventing corrupt state on crash or Ctrl+C.
 
 ---
 
+## Neo4j Graph Schema
+
+```
+(:Procedure {name, schema, sql, contentHash, embedding})
+    -[:CALLS]->              (:Procedure)
+    -[:READS_FROM]->         (:Table {name, schema})
+    -[:WRITES_TO]->          (:Table {name, schema})
+    -[:USES_PARAMETER]->     (:Parameter {procedureName, name, dataType, isOutput, hasDefault})
+    -[:SHARES_TABLE_WITH {table}]-> (:Procedure)
+```
+
+### Nodes
+
+| Label | Key Properties | Description |
+|---|---|---|
+| `:Procedure` | `name` (unique) | A stored procedure |
+| `:Table` | `name` (unique) | A database table |
+| `:Parameter` | `(procedureName, name)` (node key) | A declared procedure parameter |
+
+### Relationships
+
+| Type | Direction | Created during | Description |
+|---|---|---|---|
+| `:CALLS` | Procedure → Procedure | Parse (AST `EXEC` detection) | Static call dependency |
+| `:READS_FROM` | Procedure → Table | Parse (AST `SELECT`/`FROM`/`JOIN`) | Table read access |
+| `:WRITES_TO` | Procedure → Table | Parse (AST `INSERT`/`UPDATE`/`DELETE`/`MERGE`) | Table write access |
+| `:USES_PARAMETER` | Procedure → Parameter | Parse (AST parameter list) | Declared input/output parameter |
+| `:SHARES_TABLE_WITH` | Procedure → Procedure | Upsert (graph self-join) | Data coupling — one writes to a table the other reads |
+
+### Schema constraints and indexes
+
+- Unique constraint on `Procedure.name`
+- Unique constraint on `Table.name`
+- Node key constraint on `(Parameter.procedureName, Parameter.name)`
+- 1024-dimensional cosine-similarity vector index `procedure_embeddings` on `Procedure.embedding`
+- All constraints and the vector index are created idempotently on startup — no manual Cypher required.
+
+### Useful Cypher queries
+
+```cypher
+-- All direct callers of a procedure
+MATCH (caller:Procedure)-[:CALLS]->(callee:Procedure {name: 'usp_InsertOrder'})
+RETURN caller.name;
+
+-- Full call chain up to 3 hops (outward)
+MATCH path = (p:Procedure {name: 'usp_ProcessOrders'})-[:CALLS*1..3]->(dep:Procedure)
+RETURN path;
+
+-- Full caller chain up to 3 hops (inward) — who calls this?
+MATCH path = (caller:Procedure)-[:CALLS*1..3]->(p:Procedure {name: 'usp_InsertOrder'})
+RETURN DISTINCT caller.name;
+
+-- All tables written by a procedure
+MATCH (p:Procedure {name: 'usp_InsertOrder'})-[:WRITES_TO]->(t:Table)
+RETURN t.name;
+
+-- All procedures touching a specific table
+MATCH (p:Procedure)-[r:READS_FROM|WRITES_TO]->(t:Table {name: 'Orders'})
+RETURN p.name, type(r) AS access;
+
+-- Procedures data-coupled to a given procedure (shared table writes/reads)
+MATCH (p:Procedure {name: 'usp_InsertOrder'})-[r:SHARES_TABLE_WITH]->(other:Procedure)
+RETURN other.name, r.table AS sharedTable;
+
+-- All procedures with an INT output parameter
+MATCH (p:Procedure)-[:USES_PARAMETER]->(param:Parameter {isOutput: true})
+WHERE toUpper(param.dataType) STARTS WITH 'INT'
+RETURN p.name, param.name, param.dataType;
+```
+
+---
+
 ## Query Tools
 
-Both the AG-UI agent and the MCP server expose the same four tools backed by `HybridSearchService` and `INeo4jRepository`:
+Both the AG-UI agent and the MCP server expose seven tools backed by `HybridSearchService` and `INeo4jRepository`:
 
-| Tool | Signature | Description |
+| Tool name | Parameters | Description |
 |---|---|---|
-| `search_procedures` | `(string query)` | Hybrid search — translates the query to the data language (Dutch), embeds it, runs top-3 vector similarity, then expands 1-hop graph neighbours |
-| `get_procedure_sql` | `(string name)` | Returns the full SQL body stored in Neo4j for the named procedure |
-| `expand_call_chain` | `(string name, int depth)` | Traverses `CALLS` edges up to `depth` hops (clamped 1–5) and returns reachable procedure names |
-| `get_table_usage` | `(string tableName)` | Returns every procedure that reads from or writes to the specified table |
+| `search_procedures` | `query: string` | Hybrid search — translates query to Dutch, embeds, runs top-3 vector similarity, expands 1-hop graph neighbours |
+| `get_procedure_sql` | `name: string` | Returns the full SQL body stored in Neo4j for the named procedure |
+| `expand_call_chain` | `name: string, depth: int` | Traverses `:CALLS` outward up to `depth` hops (1–5) — returns callee names |
+| `get_caller_chain` | `name: string, depth: int` | Traverses `:CALLS` inward up to `depth` hops (1–5) — returns all upstream callers; use for impact analysis |
+| `get_table_usage` | `tableName: string` | Returns every procedure that reads from or writes to the specified table |
+| `get_shared_table_procedures` | `procedureName: string` | Returns procedures data-coupled via `:SHARES_TABLE_WITH` — procedures that read a table this one writes, or vice versa |
+| `find_procedures_by_parameter_type` | `dataType: string` | Returns all procedures that declare a parameter whose SQL data type starts with the given prefix (case-insensitive) |
 
 ### HybridSearchService — query translation
 
@@ -271,47 +372,11 @@ The knowledge base is stored in Dutch. Before embedding, any incoming query is t
 
 ### AG-UI web chat
 
-`GraphQueryTools` wraps the four tools as `AIFunction` definitions and binds them to a `ChatClientAgent` (from `Microsoft.Agents.AI`). The agent runs an automatic tool-calling loop up to `Ai:Agent:MaxToolRounds` rounds before composing its final answer.
+`GraphQueryTools` wraps the seven tools as `AIFunction` definitions and binds them to a `ChatClientAgent` (from `Microsoft.Agents.AI`). The agent runs an automatic tool-calling loop up to `Ai:Agent:MaxToolRounds` rounds before composing its final answer.
 
 ### MCP server
 
-`StoreProcTools` exposes the same four tools as `[McpServerTool]` methods, discovered automatically via `WithToolsFromAssembly`. Connect any MCP-compatible client to `Mcp:Url`.
-
----
-
-## Neo4j Graph Schema
-
-```
-(:Procedure {name, schema, sql, embedding})
-    -[:CALLS]->(:Procedure)
-    -[:READS_FROM]->(:Table {name, schema})
-    -[:WRITES_TO]->(:Table {name, schema})
-```
-
-- Unique constraint on `Procedure.name` and `Table.name`.
-- 1024-dimensional cosine-similarity vector index `procedure_embeddings` on `Procedure.embedding`.
-- All constraints and the vector index are created idempotently on startup.
-
-### Useful Cypher queries
-
-```cypher
--- All procedures that call a specific procedure
-MATCH (caller:Procedure)-[:CALLS]->(callee:Procedure {name: 'usp_InsertOrder'})
-RETURN caller.name;
-
--- Full call chain up to 3 hops
-MATCH path = (p:Procedure {name: 'usp_ProcessOrders'})-[:CALLS*1..3]->(dep:Procedure)
-RETURN path;
-
--- All tables written to by a procedure
-MATCH (p:Procedure {name: 'usp_InsertOrder'})-[:WRITES_TO]->(t:Table)
-RETURN t.name;
-
--- All procedures touching a specific table
-MATCH (p:Procedure)-[:READS_FROM|WRITES_TO]->(t:Table {name: 'Orders'})
-RETURN p.name, type(r) AS access
-  FROM (p)-[r]->(t);
-```
+`StoreProcTools` exposes the same seven tools as `[McpServerTool]` methods, discovered automatically via `WithToolsFromAssembly`. Connect any MCP-compatible client to `Mcp:Url`.
 
 ---
 
@@ -334,10 +399,12 @@ All AI provider calls (`ChatProvider`, `EmbeddingProvider`) are wrapped in Polly
 | `Vector index not found` | GenAI plugin not enabled | Enable the **GenAI / Vector** plugin in Neo4j and restart the database |
 | `401 Unauthorized` on embeddings | Wrong or expired Voyage AI key | Replace `Ai:Embedding:ApiKey` |
 | `401 Unauthorized` on chat | Wrong or expired Gemini key | Replace `Ai:Chat:ApiKey` |
-| Pipeline restarts from scratch | Checkpoint file deleted or path changed | Ensure `Ingestion:CheckpointFile` points to the same path across runs |
+| Pipeline re-ingests everything | Legacy v1 checkpoint detected | Expected on first v2 run — subsequent runs are incremental |
+| Pipeline re-ingests everything | `CheckpointFile` path changed | Ensure `Ingestion:CheckpointFile` points to the same path across runs |
 | Web chat returns 401 | Session cookie absent or expired | Re-authenticate via the login screen |
 | MCP client cannot connect | Wrong URL or firewall | Verify `Mcp:Url` matches the client configuration |
-| Files permanently stuck in `FailedFiles` | Both Tier-1 and Tier-2 repair exhausted | Inspect the file manually; it may contain non-SQL content or be empty |
+| Files permanently stuck in `failedFiles` | Both Tier-1 and Tier-2 repair exhausted | Inspect the file manually; it may contain non-SQL content or be empty |
+| `SHARES_TABLE_WITH` edges missing | Procedures ingested before the counterpart existed | Re-run `--ingest`; edges are recomputed on every upsert |
 
 ---
 
@@ -352,27 +419,28 @@ RoZwet.Tools.StoreProc/
 │   └── index.html                      AG-UI browser frontend
 └── src/
     ├── Domain/
-    │   ├── StoredProcedure.cs          Aggregate root
-    │   ├── ProcedureCall.cs            Value object
-    │   └── TableDependency.cs          Value object + TableAccessType enum
+    │   ├── StoredProcedure.cs          Aggregate root (+ ContentHash, Parameters)
+    │   ├── ProcedureCall.cs            Value object — callee name + schema
+    │   ├── TableDependency.cs          Value object + TableAccessType enum
+    │   └── ProcedureParameter.cs       Value object — name, dataType, isOutput, hasDefault
     ├── Application/
     │   ├── Contracts/
-    │   │   └── INeo4jRepository.cs     Repository port (+ SearchResult record)
+    │   │   └── INeo4jRepository.cs     Repository port (+ new query methods + result records)
     │   ├── Agents/
-    │   │   ├── SqlAnalysisAgent.cs     Tier-1 parse + embedding; Tier-2 repair
-    │   │   └── GraphQueryTools.cs      4 AIFunction tools for AG-UI agent
+    │   │   ├── SqlAnalysisAgent.cs     Parse + embed + parameter extraction + SHA-256 hashing
+    │   │   └── GraphQueryTools.cs      7 AIFunction tools for the AG-UI agent
     │   ├── McpServer/
-    │   │   └── StoreProcTools.cs       4 McpServerTool definitions
+    │   │   └── StoreProcTools.cs       7 McpServerTool definitions
     │   ├── Pipeline/
-    │   │   ├── PipelineOrchestrator.cs Durable ingestion loop
-    │   │   └── IngestionCheckpoint.cs  Atomic JSON checkpoint
+    │   │   ├── PipelineOrchestrator.cs Incremental ingestion loop (hash-based skip)
+    │   │   └── IngestionCheckpoint.cs  Hash-map checkpoint (processedFiles + failedFiles)
     │   └── Services/
     │       ├── HybridSearchService.cs  Vector + graph hybrid search
     │       └── ChatService.cs          Agentic tool-calling loop
     └── Infrastructure/
         ├── Parsing/
         │   ├── LegacySqlPreprocessor.cs  8-rule Sybase regex normaliser
-        │   ├── TsqlFragmentVisitor.cs    ScriptDom AST visitor
+        │   ├── TsqlFragmentVisitor.cs    ScriptDom AST → CALLS + table dependencies
         │   └── AiSqlRepairAgent.cs       LLM-based syntax repair
         ├── Ai/
         │   ├── ChatProvider.cs           Gemini facade + Polly
@@ -380,7 +448,7 @@ RoZwet.Tools.StoreProc/
         │   ├── AiResilienceOptions.cs    Retry config record
         │   └── AiResiliencePipelineFactory.cs  Polly pipeline builder
         └── Neo4j/
-            ├── Neo4jRepository.cs        INeo4jRepository implementation
+            ├── Neo4jRepository.cs        Full INeo4jRepository implementation
             └── Neo4jIndexInitializer.cs  Idempotent schema bootstrap
 ```
 
@@ -394,6 +462,6 @@ RoZwet.Tools.StoreProc/
 
 ## Version
 
-**v1.9.0** — AG-UI web chat · MCP server · two-tier AI-assisted ingestion pipeline · Dutch query translation · Polly resilience · durable checkpoint with failure tracking.
+**v2.0.0** — Extended graph schema with `:USES_PARAMETER`, `:SHARES_TABLE_WITH`, and reverse CALLS traversal · 7 AI + MCP tools · Incremental daily ingestion via SHA-256 content-hash change detection · Hash-map checkpoint replacing sequential index format.
 
 Versioning follows [Semantic Versioning 2.0.0](https://semver.org/).

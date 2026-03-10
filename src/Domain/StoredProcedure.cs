@@ -7,6 +7,7 @@ public sealed class StoredProcedure
 {
     private readonly List<ProcedureCall> _calls = [];
     private readonly List<TableDependency> _tableDependencies = [];
+    private readonly List<ProcedureParameter> _parameters = [];
 
     /// <summary>
     /// Initializes a stored procedure with its identity and raw SQL.
@@ -32,6 +33,12 @@ public sealed class StoredProcedure
     /// <summary>Full raw SQL body.</summary>
     public string Sql { get; }
 
+    /// <summary>
+    /// SHA-256 hex digest of the raw SQL file content.
+    /// Used for incremental ingestion change detection.
+    /// </summary>
+    public string? ContentHash { get; private set; }
+
     /// <summary>Semantic vector embedding (1024 dimensions).</summary>
     public float[]? Embedding { get; private set; }
 
@@ -40,6 +47,21 @@ public sealed class StoredProcedure
 
     /// <summary>Read-only view of tables this procedure reads from or writes to.</summary>
     public IReadOnlyList<TableDependency> TableDependencies => _tableDependencies.AsReadOnly();
+
+    /// <summary>Read-only view of declared input/output parameters of this procedure.</summary>
+    public IReadOnlyList<ProcedureParameter> Parameters => _parameters.AsReadOnly();
+
+    /// <summary>
+    /// Applies the SHA-256 content hash of the source SQL file.
+    /// Used by the ingestion pipeline for change detection.
+    /// </summary>
+    public void ApplyContentHash(string hash)
+    {
+        if (string.IsNullOrWhiteSpace(hash))
+            throw new ArgumentException("Content hash cannot be empty.", nameof(hash));
+
+        ContentHash = hash;
+    }
 
     /// <summary>
     /// Applies the semantic embedding produced by the analysis agent.
@@ -70,6 +92,16 @@ public sealed class StoredProcedure
         ArgumentNullException.ThrowIfNull(dependency);
         if (!_tableDependencies.Contains(dependency))
             _tableDependencies.Add(dependency);
+    }
+
+    /// <summary>
+    /// Registers a declared parameter discovered during SQL parsing.
+    /// </summary>
+    public void AddParameter(ProcedureParameter parameter)
+    {
+        ArgumentNullException.ThrowIfNull(parameter);
+        if (!_parameters.Contains(parameter))
+            _parameters.Add(parameter);
     }
 
     /// <summary>

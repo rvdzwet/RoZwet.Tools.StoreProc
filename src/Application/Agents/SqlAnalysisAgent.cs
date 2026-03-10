@@ -1,8 +1,11 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.SqlServer.TransactSql.ScriptDom;
 using RoZwet.Tools.StoreProc.Domain;
 using RoZwet.Tools.StoreProc.Infrastructure.Ai;
 using RoZwet.Tools.StoreProc.Infrastructure.Parsing;
+using DomainParameter = RoZwet.Tools.StoreProc.Domain.ProcedureParameter;
 
 namespace RoZwet.Tools.StoreProc.Application.Agents;
 
@@ -57,6 +60,16 @@ internal sealed class SqlAnalysisAgent
     }
 
     /// <summary>
+    /// Computes the SHA-256 hex digest of raw SQL text.
+    /// Used for incremental change detection in the ingestion pipeline.
+    /// </summary>
+    public static string ComputeContentHash(string sql)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(sql));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
+    /// <summary>
     /// Attempts Tier-1 parsing (deterministic only — no AI).
     /// Returns immediately: success path builds the procedure scaffold;
     /// failure path returns the normalized SQL and errors for the background repair agent.
@@ -96,6 +109,8 @@ internal sealed class SqlAnalysisAgent
             return new Tier1Result(false, null, sql, normalizedSql, errors);
         }
 
+        procedure.ApplyContentHash(ComputeContentHash(sql));
+
         return new Tier1Result(true, procedure, sql, normalizedSql, errors);
     }
 
@@ -112,8 +127,8 @@ internal sealed class SqlAnalysisAgent
         procedure.ApplyEmbedding(embedding);
 
         _logger.LogDebug(
-            "Embedding applied to '{Name}': {Calls} calls, {Tables} table deps.",
-            procedure.Name, procedure.Calls.Count, procedure.TableDependencies.Count);
+            "Embedding applied to '{Name}': {Calls} calls, {Tables} table deps, {Params} params.",
+            procedure.Name, procedure.Calls.Count, procedure.TableDependencies.Count, procedure.Parameters.Count);
 
         return procedure;
     }
@@ -131,8 +146,8 @@ internal sealed class SqlAnalysisAgent
         string originalSql,
         CancellationToken cancellationToken = default)
     {
-        var parser     = new TSql160Parser(initialQuotedIdentifiers: true);
-        var currentSql = normalizedSql;
+        var parser        = new TSql160Parser(initialQuotedIdentifiers: true);
+        var currentSql    = normalizedSql;
         var currentErrors = errors;
         TSqlFragment? fragment = null;
 
@@ -161,7 +176,7 @@ internal sealed class SqlAnalysisAgent
                 _logger.LogInformation(
                     "[BG-REPAIR] Succeeded for '{File}' after {Round} round(s).",
                     Path.GetFileName(sqlFilePath), round);
-                fragment = repairedFragment;
+                fragment      = repairedFragment;
                 currentErrors = repairedErrors;
                 break;
             }
@@ -204,6 +219,8 @@ internal sealed class SqlAnalysisAgent
             return null;
         }
 
+        procedure.ApplyContentHash(ComputeContentHash(originalSql));
+
         return await ApplyEmbeddingAsync(procedure, originalSql, cancellationToken);
     }
 
@@ -222,6 +239,8 @@ internal sealed class SqlAnalysisAgent
 
         var procedure = new StoredProcedure(name, schema, originalSql);
 
+        ExtractParameters(createProc, procedure);
+
         var visitor = new StoredProcedureVisitor();
         fragment.Accept(visitor);
 
@@ -232,6 +251,54 @@ internal sealed class SqlAnalysisAgent
             procedure.AddTableDependency(dep);
 
         return procedure;
+    }
+
+    private static void ExtractParameters(
+        CreateProcedureStatement createProc,
+        StoredProcedure procedure)
+    {
+        if (createProc.Parameters is null || createProc.Parameters.Count == 0)
+            return;
+
+        foreach (var param in createProc.Parameters)
+        {
+            var paramName = param.VariableName?.Value;
+            if (string.IsNullOrWhiteSpace(paramName))
+                continue;
+
+            var dataType = ResolveDataTypeName(param.DataType);
+            var isOutput = param.Modifier == ParameterModifier.Output
+                           || param.Modifier == ParameterModifier.ReadOnly;
+            var hasDefault = param.Value is not null;
+
+            // Ensure the @ sigil is present for consistency.
+            if (!paramName.StartsWith('@'))
+                paramName = "@" + paramName;
+
+            procedure.AddParameter(new DomainParameter(paramName, dataType, isOutput, hasDefault));
+        }
+    }
+
+    private static string ResolveDataTypeName(DataTypeReference? dataType)
+    {
+        if (dataType is null)
+            return "UNKNOWN";
+
+        var name = dataType switch
+        {
+            SqlDataTypeReference sqlRef => sqlRef.SqlDataTypeOption.ToString().ToUpperInvariant(),
+            UserDataTypeReference userRef => userRef.Name?.BaseIdentifier?.Value?.ToUpperInvariant() ?? "UNKNOWN",
+            _ => "UNKNOWN"
+        };
+
+        // Append size qualifiers for parameterized types.
+        if (dataType is SqlDataTypeReference { Parameters.Count: > 0 } sized)
+        {
+            var sizeParams = string.Join(", ", sized.Parameters.Select(p => p.LiteralType == LiteralType.Max ? "MAX" : p.Value));
+            return $"{name}({sizeParams})";
+        }
+
+        return name;
     }
 
     private static CreateProcedureStatement? FindCreateProcedureStatement(TSqlFragment fragment)

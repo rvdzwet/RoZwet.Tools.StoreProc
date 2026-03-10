@@ -47,6 +47,11 @@ internal sealed class Neo4jIndexInitializer
             "table_name_unique",
             cancellationToken);
 
+        await ApplyConstraintAsync(session,
+            "CREATE CONSTRAINT parameter_identity_unique IF NOT EXISTS FOR (param:Parameter) REQUIRE (param.procedureName, param.name) IS NODE KEY",
+            "parameter_identity_unique",
+            cancellationToken);
+
         await ApplyVectorIndexAsync(session, cancellationToken);
 
         _logger.LogInformation("Neo4j schema initialization complete.");

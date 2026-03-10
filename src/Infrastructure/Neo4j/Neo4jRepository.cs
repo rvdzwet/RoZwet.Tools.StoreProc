@@ -47,10 +47,43 @@ internal sealed class Neo4jRepository : INeo4jRepository
                 await UpsertProcedureNodeAsync(tx, proc);
                 await UpsertCallRelationshipsAsync(tx, proc);
                 await UpsertTableRelationshipsAsync(tx, proc);
+                await UpsertParameterRelationshipsAsync(tx, proc);
+            }
+
+            foreach (var proc in procedures)
+            {
+                await UpsertSharedTableRelationshipsAsync(tx, proc);
             }
         });
 
         _logger.LogDebug("Upserted batch of {Count} procedures.", procedures.Count);
+    }
+
+    /// <inheritdoc />
+    public async Task<string?> GetContentHashAsync(
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return null;
+
+        await using var session = _driver.AsyncSession();
+
+        const string cypher = """
+            MATCH (p:Procedure {name: $name})
+            RETURN p.contentHash AS contentHash
+            LIMIT 1
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { name });
+
+        string? hash = null;
+        await cursor.ForEachAsync(record =>
+        {
+            hash = record["contentHash"].As<string?>();
+        });
+
+        return hash;
     }
 
     /// <inheritdoc />
@@ -155,8 +188,7 @@ internal sealed class Neo4jRepository : INeo4jRepository
 
         await using var session = _driver.AsyncSession();
 
-        // Neo4j path-length bounds must be integer literals — not Cypher parameters.
-        // depth is a validated positive int (not user string input) so baking it in is safe.
+        // depth is a validated positive int (not user string input) — safe to interpolate.
         var cypher = $$"""
             MATCH (root:Procedure {name: $name})-[:CALLS*1..{{depth}}]->(callee:Procedure)
             RETURN DISTINCT callee.name AS calleeName
@@ -171,6 +203,37 @@ internal sealed class Neo4jRepository : INeo4jRepository
             var callee = record["calleeName"].As<string?>();
             if (!string.IsNullOrWhiteSpace(callee))
                 chain.Add(callee);
+        });
+
+        return chain.AsReadOnly();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<string>> GetCallerChainAsync(
+        string name,
+        int depth,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name) || depth <= 0)
+            return [];
+
+        await using var session = _driver.AsyncSession();
+
+        // depth is a validated positive int — safe to interpolate.
+        var cypher = $$"""
+            MATCH (caller:Procedure)-[:CALLS*1..{{depth}}]->(target:Procedure {name: $name})
+            RETURN DISTINCT caller.name AS callerName
+            ORDER BY callerName
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { name });
+
+        var chain = new List<string>();
+        await cursor.ForEachAsync(record =>
+        {
+            var caller = record["callerName"].As<string?>();
+            if (!string.IsNullOrWhiteSpace(caller))
+                chain.Add(caller);
         });
 
         return chain.AsReadOnly();
@@ -205,21 +268,85 @@ internal sealed class Neo4jRepository : INeo4jRepository
         return procedures.AsReadOnly();
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<SharedTableProcedure>> GetSharedTableProceduresAsync(
+        string procedureName,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(procedureName))
+            return [];
+
+        await using var session = _driver.AsyncSession();
+
+        const string cypher = """
+            MATCH (p:Procedure {name: $name})-[r:SHARES_TABLE_WITH]->(other:Procedure)
+            RETURN other.name AS procName, r.table AS tableName
+            ORDER BY tableName, procName
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { name = procedureName });
+
+        var results = new List<SharedTableProcedure>();
+        await cursor.ForEachAsync(record =>
+        {
+            var proc  = record["procName"].As<string?>();
+            var table = record["tableName"].As<string?>();
+            if (!string.IsNullOrWhiteSpace(proc) && !string.IsNullOrWhiteSpace(table))
+                results.Add(new SharedTableProcedure(proc, table));
+        });
+
+        return results.AsReadOnly();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ParameterMatch>> FindProceduresByParameterTypeAsync(
+        string dataType,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(dataType))
+            return [];
+
+        await using var session = _driver.AsyncSession();
+
+        const string cypher = """
+            MATCH (p:Procedure)-[:USES_PARAMETER]->(param:Parameter)
+            WHERE toUpper(param.dataType) STARTS WITH toUpper($dataType)
+            RETURN p.name AS procName, param.name AS paramName, param.dataType AS dataType
+            ORDER BY procName, paramName
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { dataType });
+
+        var results = new List<ParameterMatch>();
+        await cursor.ForEachAsync(record =>
+        {
+            var proc  = record["procName"].As<string?>();
+            var param = record["paramName"].As<string?>();
+            var type  = record["dataType"].As<string?>();
+            if (!string.IsNullOrWhiteSpace(proc) && !string.IsNullOrWhiteSpace(param) && !string.IsNullOrWhiteSpace(type))
+                results.Add(new ParameterMatch(proc, param, type));
+        });
+
+        return results.AsReadOnly();
+    }
+
     private static async Task UpsertProcedureNodeAsync(IAsyncQueryRunner tx, StoredProcedure proc)
     {
         const string cypher = """
             MERGE (p:Procedure {name: $name})
-            SET p.schema = $schema,
-                p.sql    = $sql,
-                p.embedding = $embedding
+            SET p.schema      = $schema,
+                p.sql         = $sql,
+                p.contentHash = $contentHash,
+                p.embedding   = $embedding
             """;
 
         await tx.RunAsync(cypher, new
         {
-            name = proc.Name,
-            schema = proc.Schema,
-            sql = proc.Sql,
-            embedding = proc.Embedding ?? Array.Empty<float>()
+            name        = proc.Name,
+            schema      = proc.Schema,
+            sql         = proc.Sql,
+            contentHash = proc.ContentHash ?? string.Empty,
+            embedding   = proc.Embedding ?? Array.Empty<float>()
         });
     }
 
@@ -239,8 +366,8 @@ internal sealed class Neo4jRepository : INeo4jRepository
         {
             await tx.RunAsync(cypher, new
             {
-                callerName = proc.Name,
-                calleeName = call.CalleeName,
+                callerName   = proc.Name,
+                calleeName   = call.CalleeName,
                 calleeSchema = call.CalleeSchema
             });
         }
@@ -270,10 +397,53 @@ internal sealed class Neo4jRepository : INeo4jRepository
             var cypher = dep.AccessType == TableAccessType.Read ? readCypher : writeCypher;
             await tx.RunAsync(cypher, new
             {
-                procName = proc.Name,
-                tableName = dep.TableName,
+                procName    = proc.Name,
+                tableName   = dep.TableName,
                 tableSchema = dep.TableSchema
             });
         }
+    }
+
+    private static async Task UpsertParameterRelationshipsAsync(IAsyncQueryRunner tx, StoredProcedure proc)
+    {
+        if (proc.Parameters.Count == 0)
+            return;
+
+        const string cypher = """
+            MATCH (p:Procedure {name: $procName})
+            MERGE (param:Parameter {procedureName: $procName, name: $paramName})
+            SET param.dataType   = $dataType,
+                param.isOutput   = $isOutput,
+                param.hasDefault = $hasDefault
+            MERGE (p)-[:USES_PARAMETER]->(param)
+            """;
+
+        foreach (var parameter in proc.Parameters)
+        {
+            await tx.RunAsync(cypher, new
+            {
+                procName   = proc.Name,
+                paramName  = parameter.Name,
+                dataType   = parameter.DataType,
+                isOutput   = parameter.IsOutput,
+                hasDefault = parameter.HasDefault
+            });
+        }
+    }
+
+    private static async Task UpsertSharedTableRelationshipsAsync(IAsyncQueryRunner tx, StoredProcedure proc)
+    {
+        // For each table this procedure writes to, create SHARES_TABLE_WITH edges
+        // pointing at all other procedures that read from the same table.
+        // Also covers the reverse: tables this procedure reads from that others write to.
+        const string cypher = """
+            MATCH (a:Procedure {name: $procName})-[:WRITES_TO]->(t:Table)<-[:READS_FROM]-(b:Procedure)
+            WHERE a.name <> b.name
+            MERGE (a)-[r:SHARES_TABLE_WITH {table: t.name}]->(b)
+            WITH a, t, b
+            MERGE (b)-[r2:SHARES_TABLE_WITH {table: t.name}]->(a)
+            """;
+
+        await tx.RunAsync(cypher, new { procName = proc.Name });
     }
 }
