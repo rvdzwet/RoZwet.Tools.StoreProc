@@ -58,19 +58,27 @@ internal sealed class PipelineOrchestrator
 
         int startIndex = _checkpoint.LastCommittedIndex + 1;
 
-        if (startIndex >= sqlFiles.Length)
+        if (startIndex >= sqlFiles.Length && _checkpoint.FailedFilePaths.Count == 0)
         {
             _logger.LogInformation("All {Total} files already processed. Nothing to do.", sqlFiles.Length);
+            return;
+        }
+
+        await _repository.EnsureSchemaAsync(cancellationToken);
+
+        var totalProcessed = Math.Max(0, _checkpoint.LastCommittedIndex + 1);
+
+        totalProcessed = await RetryPreviouslyFailedFilesAsync(totalProcessed, batchSize, cancellationToken);
+
+        if (startIndex >= sqlFiles.Length)
+        {
+            _logger.LogInformation("Main scan already complete. Only retry pass was executed.");
             return;
         }
 
         _logger.LogInformation(
             "Starting ingestion from file index {Start} / {Total}.",
             startIndex, sqlFiles.Length);
-
-        await _repository.EnsureSchemaAsync(cancellationToken);
-
-        var totalProcessed = _checkpoint.LastCommittedIndex + 1;
         var batchBuffer = new List<StoredProcedure>(batchSize);
 
         for (int i = startIndex; i < sqlFiles.Length; i++)
@@ -92,26 +100,125 @@ internal sealed class PipelineOrchestrator
             }
 
             if (procedure is not null)
+            {
                 batchBuffer.Add(procedure);
+            }
+            else
+            {
+                _checkpoint.RecordFailure(filePath);
+            }
 
             bool isBatchFull = batchBuffer.Count >= batchSize;
             bool isLastFile = i == sqlFiles.Length - 1;
 
-            if ((isBatchFull || isLastFile) && batchBuffer.Count > 0)
+            if (isBatchFull || isLastFile)
             {
-                await _repository.UpsertBatchAsync(batchBuffer.AsReadOnly(), cancellationToken);
+                if (batchBuffer.Count > 0)
+                {
+                    await _repository.UpsertBatchAsync(batchBuffer.AsReadOnly(), cancellationToken);
+                    totalProcessed += batchBuffer.Count;
 
-                totalProcessed += batchBuffer.Count;
+                    _logger.LogInformation(
+                        "Batch committed: {BatchCount} procedures. Total committed: {Total}/{Grand}.",
+                        batchBuffer.Count, totalProcessed, sqlFiles.Length);
+
+                    batchBuffer.Clear();
+                }
+
                 await _checkpoint.CommitAsync(i, totalProcessed, cancellationToken);
-
-                _logger.LogInformation(
-                    "Batch committed: {BatchCount} procedures. Total committed: {Total}/{Grand}.",
-                    batchBuffer.Count, totalProcessed, sqlFiles.Length);
-
-                batchBuffer.Clear();
             }
         }
 
         _logger.LogInformation("Ingestion complete. {Total} procedures processed.", totalProcessed);
+    }
+
+    /// <summary>
+    /// Re-processes every file that is recorded as failed in the current checkpoint.
+    /// Files that succeed are cleared from the failure list; files that still fail are
+    /// re-recorded so they remain visible in the checkpoint for operator inspection.
+    /// The scan-head index (<see cref="IngestionCheckpoint.LastCommittedIndex"/>) is
+    /// not advanced during this pass — only <c>FailedFiles</c> and
+    /// <paramref name="totalProcessed"/> are updated.
+    /// </summary>
+    private async Task<int> RetryPreviouslyFailedFilesAsync(
+        int totalProcessed,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        var failedPaths = _checkpoint.FailedFilePaths;
+        if (failedPaths.Count == 0)
+            return totalProcessed;
+
+        _logger.LogInformation(
+            "Retrying {Count} previously failed file(s) from checkpoint.",
+            failedPaths.Count);
+
+        var retryBuffer = new List<StoredProcedure>(batchSize);
+        int recovered = 0;
+        int stillFailing = 0;
+
+        foreach (var filePath in failedPaths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!File.Exists(filePath))
+            {
+                _logger.LogWarning("Previously failed file no longer exists on disk: '{FilePath}'. Removing from failures.", filePath);
+                _checkpoint.ClearFailure(filePath);
+                continue;
+            }
+
+            _logger.LogInformation("[RETRY] {File}", Path.GetFileName(filePath));
+
+            StoredProcedure? procedure = null;
+
+            try
+            {
+                procedure = await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[RETRY] Failed to analyze '{FilePath}'.", filePath);
+            }
+
+            if (procedure is not null)
+            {
+                retryBuffer.Add(procedure);
+                _checkpoint.ClearFailure(filePath);
+                recovered++;
+
+                if (retryBuffer.Count >= batchSize)
+                {
+                    await _repository.UpsertBatchAsync(retryBuffer.AsReadOnly(), cancellationToken);
+                    totalProcessed += retryBuffer.Count;
+                    retryBuffer.Clear();
+                    await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
+                }
+            }
+            else
+            {
+                _checkpoint.RecordFailure(filePath);
+                stillFailing++;
+
+                // Commit the still-failing record immediately so it is never silently lost
+                // even if the process is killed before the retry pass completes.
+                await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
+            }
+        }
+
+        if (retryBuffer.Count > 0)
+        {
+            await _repository.UpsertBatchAsync(retryBuffer.AsReadOnly(), cancellationToken);
+            totalProcessed += retryBuffer.Count;
+        }
+
+        // Final commit: flushes any pending clears for recovered files in the last partial batch.
+        await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
+
+        _logger.LogInformation(
+            "Retry pass complete: {Recovered} recovered, {StillFailing} still failing.",
+            recovered, stillFailing);
+
+        return totalProcessed;
     }
 }

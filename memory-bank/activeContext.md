@@ -1,7 +1,7 @@
 # ACTIVE CONTEXT: RoZwet.Tools.StoreProc
 
 ## Current Operation
-**v1.2.0 — Two-Tier SQL Parse Resilience (AI-Assisted Repair)**
+**v1.4.0 — Streaming Reasoning Output + Retry Durability Fix**
 
 ## State
 - Phase: Production Ready
@@ -25,29 +25,49 @@
 - [x] `SqlAnalysisAgent` — injected `AiSqlRepairAgent`; `ParseProcedure` made async; two-tier logic: Tier-1 preprocessor → Tier-2 AI repair on parse failure; warnings only emitted when AI also fails
 - [x] `Program.cs` — registered `AiSqlRepairAgent` as singleton; added `using RoZwet.Tools.StoreProc.Infrastructure.Parsing`
 
+## Completed Steps — v1.3.0 Polly Resilience + Checkpoint Warning Tracking
+- [x] `Polly` v8.5.2 — added to csproj
+- [x] `AiResilienceOptions` (NEW) — config-bound record: `MaxRetries` (6), `BaseDelaySeconds` (2.0), `MaxDelaySeconds` (60.0)
+- [x] `AiResiliencePipelineFactory` (NEW) — static factory; `ResiliencePipeline<T>` with exponential backoff + full jitter; retries on `ClientResultException` (429) and `HttpRequestException` only; logs structured warning on each retry attempt
+- [x] `ChatProvider` — constructor accepts `AiResilienceOptions`; `_pipeline` (`ResiliencePipeline<string>`) wraps `CompleteAsync` body; manual error handling removed
+- [x] `EmbeddingProvider` — constructor accepts `AiResilienceOptions`; `_pipeline` (`ResiliencePipeline<float[]>`) wraps `GenerateAsync` body; manual `ClientResultException` catch removed
+- [x] `appsettings.json` — added `"Ai": { ..., "Resilience": { "MaxRetries": 6, "BaseDelaySeconds": 2.0, "MaxDelaySeconds": 60.0 } }`
+- [x] `Program.cs` — `AiResilienceOptions` registered as singleton, bound from `Ai:Resilience`; injected into both provider constructors via DI
+- [x] `IngestionCheckpoint` — `CheckpointState.FailedFiles` (`HashSet<string>`) persisted as sorted JSON array; `RecordFailure(filePath)` accumulates pending failures; `CommitAsync` merges + flushes pending failures atomically; `LoadAsync` restored (was commented out); `FailedFilePaths` read property exposed
+- [x] `PipelineOrchestrator` — calls `_checkpoint.RecordFailure(filePath)` when `AnalyzeAsync` returns null; commit boundary now always calls `CommitAsync` (even when batchBuffer is empty) to ensure failures are durably flushed on every batch boundary
+
 ## AI Provider Configuration (v1.1.0)
 | Role | Provider | Model | Endpoint |
 |---|---|---|---|
 | Chat / Agent | Google Gemini | `gemini-3-flash-preview` | `https://generativelanguage.googleapis.com/v1beta/openai/` |
 | Embeddings | Voyage AI | `voyage-4-large` | `https://api.voyageai.com/v1` |
 
-## Microsoft.Extensions.AI v9.5.0 — Verified API Surface
-| Element | Confirmed Signature |
+## Resilience Configuration (v1.3.0)
+| Attempt | Approx. Wait |
 |---|---|
-| `ChatResponse.Messages` | `IList<ChatMessage>` (plural) |
-| `FunctionResultContent` ctor | `(string callId, object result)` — 2 args |
-| `FunctionCallContent.Arguments` | `IDictionary<string, object>` |
-| `AIFunction.Name` | Direct property — no `.Metadata` wrapper |
-| `AIFunction.InvokeAsync` | `(AIFunctionArguments args, CancellationToken ct)` |
-| `AIFunctionArguments` ctor | `(IDictionary<string, object>)` |
+| 1 | ~2s + jitter |
+| 2 | ~4s + jitter |
+| 3 | ~8s + jitter |
+| 4 | ~16s + jitter |
+| 5 | ~32s + jitter |
+| 6 | ~60s (capped) |
+| 7th failure | propagates as original exception |
 
-## Agentic Tool Definitions (GraphQueryTools)
-| Tool Name | Description |
-|---|---|
-| `search_procedures` | Hybrid vector+graph search for semantically related procedures |
-| `get_procedure_sql` | Returns full SQL body of a named procedure |
-| `expand_call_chain` | Traverses CALLS edges up to depth N (clamped 1–5) |
-| `get_table_usage` | Returns all procedures referencing a named table |
+Only retries on: `ClientResultException` with `Status == 429` and `HttpRequestException`.
+All other exceptions (400, 401, 500) surface immediately — no retry.
+
+## Checkpoint JSON Shape (v1.3.0)
+```json
+{
+  "LastCommittedIndex": 1199,
+  "TotalProcessed": 1190,
+  "LastCommittedUtc": "2026-03-10T14:00:00Z",
+  "FailedFiles": [
+    "C:\\SP\\sp\\proc_bad_syntax.sp",
+    "C:\\SP\\sp\\proc_legacy_cursor.sp"
+  ]
+}
+```
 
 ## Package Versions (Resolved)
 | Package | Version |
@@ -58,6 +78,7 @@
 | Microsoft.SqlServer.TransactSql.ScriptDom | 170.3.0 |
 | Neo4j.Driver | 5.28.0 |
 | OpenAI | 2.8.0 |
+| Polly | 8.5.2 |
 
 ## Next Steps (Operator Actions Required)
 1. Set real API keys in `appsettings.json`:
@@ -67,6 +88,7 @@
 2. Place 5,500 `.sql` files in `Ingestion:SqlSourceDirectory` (default: `./sql`)
 3. Run ingestion: `dotnet run -- --ingest`
 4. Start agentic chat: `dotnet run -- --chat`
+5. After ingestion, inspect checkpoint JSON for `FailedFiles` to identify procedures requiring manual review
 
 ## Risk Register
 | Risk | Status |
@@ -76,3 +98,5 @@
 | Neo4j vector index not available | MITIGATED — idempotent init with clear error logging |
 | Interruption during 5,500-file run | MITIGATED — checkpoint.json ensures resume from last committed batch |
 | Agentic loop runaway | MITIGATED — MaxToolRounds=5 cap, tool exceptions caught and returned as error content |
+| AI provider rate-limiting (429) | MITIGATED — Polly retry pipeline: 6 attempts, exponential backoff + jitter, 2s–60s delay window |
+| Failed files silently lost from checkpoint | MITIGATED — FailedFiles array in checkpoint.json; committed on every batch boundary |

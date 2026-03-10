@@ -9,6 +9,7 @@ namespace RoZwet.Tools.StoreProc.Application.Services;
 /// Agentic chat service: runs a tool-calling loop that lets the language model
 /// query the Neo4j graph knowledge base before composing its final answer.
 /// The loop is capped at <c>Ai:Agent:MaxToolRounds</c> to prevent runaway execution.
+/// Supports both blocking and streaming completion for the final answer turn.
 /// </summary>
 internal sealed class ChatService
 {
@@ -84,20 +85,112 @@ internal sealed class ChatService
             _logger.LogDebug("Tool round {Round}/{Max}: executing {Count} call(s).",
                 round + 1, _maxToolRounds, toolCalls.Count);
 
-            var toolResultContents = new List<AIContent>(toolCalls.Count);
-            foreach (var toolCall in toolCalls)
-            {
-                var result = await InvokeToolSafeAsync(toolCall, cancellationToken);
-                toolResultContents.Add(new FunctionResultContent(toolCall.CallId, result));
-            }
-
-            messages.Add(new ChatMessage(ChatRole.Tool, toolResultContents));
+            await ExecuteToolCallsAsync(messages, toolCalls, cancellationToken);
         }
 
         _logger.LogWarning("MaxToolRounds ({Max}) exhausted. Requesting final answer without tools.", _maxToolRounds);
 
         var finalResponse = await _chatClient.GetResponseAsync(messages, new ChatOptions(), cancellationToken);
         return finalResponse.Text ?? string.Empty;
+    }
+
+    /// <summary>
+    /// Answers a user question using the agentic GraphRAG pipeline, streaming
+    /// both reasoning tokens and final answer tokens as they arrive.
+    /// Tool-calling rounds are resolved in full before streaming the final answer.
+    /// </summary>
+    /// <param name="question">The raw user question.</param>
+    /// <param name="onChunk">
+    /// Callback invoked for each streamed token.
+    /// <c>isReasoning=true</c> indicates a model thinking/reasoning token;
+    /// <c>isReasoning=false</c> indicates a final answer token.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task AskStreamingAsync(
+        string question,
+        Action<bool, string> onChunk,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(question))
+            throw new ArgumentException("Question cannot be empty.", nameof(question));
+
+        ArgumentNullException.ThrowIfNull(onChunk);
+
+        _logger.LogInformation("Agentic streaming chat started. MaxToolRounds={Max}.", _maxToolRounds);
+
+        var chatOptions = new ChatOptions { Tools = [.. _tools.All] };
+
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.System, SystemPrompt),
+            new(ChatRole.User, question)
+        };
+
+        for (int round = 0; round < _maxToolRounds; round++)
+        {
+            var response = await _chatClient.GetResponseAsync(messages, chatOptions, cancellationToken);
+            messages.AddRange(response.Messages);
+
+            var toolCalls = response.Messages
+                .SelectMany(m => m.Contents.OfType<FunctionCallContent>())
+                .ToList();
+
+            if (toolCalls.Count == 0)
+            {
+                _logger.LogInformation("Tool rounds complete after {Rounds} round(s). Streaming final answer.", round);
+                await StreamFinalAnswerAsync(messages, onChunk, cancellationToken);
+                return;
+            }
+
+            _logger.LogDebug("Tool round {Round}/{Max}: executing {Count} call(s).",
+                round + 1, _maxToolRounds, toolCalls.Count);
+
+            await ExecuteToolCallsAsync(messages, toolCalls, cancellationToken);
+        }
+
+        _logger.LogWarning("MaxToolRounds ({Max}) exhausted. Streaming final answer without tools.", _maxToolRounds);
+        await StreamFinalAnswerAsync(messages, onChunk, cancellationToken);
+    }
+
+    private async Task StreamFinalAnswerAsync(
+        List<ChatMessage> messages,
+        Action<bool, string> onChunk,
+        CancellationToken cancellationToken)
+    {
+        var streamingOptions = new ChatOptions();
+
+        await foreach (var update in _chatClient.GetStreamingResponseAsync(messages, streamingOptions, cancellationToken))
+        {
+            foreach (var content in update.Contents)
+            {
+                string? text = content switch
+                {
+                    TextContent tc      => tc.Text,
+                    _                   => null
+                };
+
+                if (text is null || text.Length == 0)
+                    continue;
+
+                bool isReasoning = content is not TextContent;
+                onChunk(isReasoning, text);
+            }
+        }
+    }
+
+    private async Task ExecuteToolCallsAsync(
+        List<ChatMessage> messages,
+        List<FunctionCallContent> toolCalls,
+        CancellationToken cancellationToken)
+    {
+        var toolResultContents = new List<AIContent>(toolCalls.Count);
+        foreach (var toolCall in toolCalls)
+        {
+            var result = await InvokeToolSafeAsync(toolCall, cancellationToken);
+            toolResultContents.Add(new FunctionResultContent(toolCall.CallId, result));
+        }
+
+        messages.Add(new ChatMessage(ChatRole.Tool, toolResultContents));
     }
 
     private async Task<object?> InvokeToolSafeAsync(

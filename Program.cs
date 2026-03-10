@@ -118,6 +118,13 @@ internal static class Program
             return openAiClient.GetChatClient(chatModel).AsIChatClient();
         });
 
+        services.AddSingleton(_ =>
+        {
+            var opts = new AiResilienceOptions();
+            config.GetSection("Ai:Resilience").Bind(opts);
+            return opts;
+        });
+
         services.AddSingleton<EmbeddingProvider>();
         services.AddSingleton<ChatProvider>();
     }
@@ -203,12 +210,44 @@ internal static class Program
 
             try
             {
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("\nAssistant:");
-                Console.ResetColor();
+                bool reasoningHeaderPrinted = false;
+                bool answerHeaderPrinted    = false;
 
-                var answer = await chatService.AskAsync(input, cts.Token);
-                Console.WriteLine(answer);
+                void OnChunk(bool isReasoning, string chunk)
+                {
+                    if (isReasoning)
+                    {
+                        if (!reasoningHeaderPrinted)
+                        {
+                            Console.ForegroundColor = ConsoleColor.DarkGray;
+                            Console.WriteLine("\n[Thinking]");
+                            reasoningHeaderPrinted = true;
+                        }
+
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.Write(chunk);
+                        Console.Out.Flush();
+                    }
+                    else
+                    {
+                        if (!answerHeaderPrinted)
+                        {
+                            Console.ResetColor();
+                            Console.ForegroundColor = ConsoleColor.Green;
+                            Console.WriteLine("\n\nAssistant:");
+                            Console.ResetColor();
+                            answerHeaderPrinted = true;
+                        }
+
+                        Console.Write(chunk);
+                        Console.Out.Flush();
+                    }
+                }
+
+                await chatService.AskStreamingAsync(input, OnChunk, cts.Token);
+
+                Console.ResetColor();
+                Console.WriteLine();
             }
             catch (OperationCanceledException)
             {
