@@ -1,14 +1,19 @@
-﻿using Microsoft.AspNetCore.Builder;
+﻿using Microsoft.Agents.AI;
+using Microsoft.Agents.AI.Hosting.AGUI.AspNetCore;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
-using Neo4j.Driver;
 using Mscc.GenerativeAI.Microsoft;
+using Neo4j.Driver;
 using OpenAI;
 using System.ClientModel;
+using System.Security.Cryptography;
+using System.Text;
 using RoZwet.Tools.StoreProc.Application.Agents;
 using RoZwet.Tools.StoreProc.Application.Contracts;
 using RoZwet.Tools.StoreProc.Application.McpServer;
@@ -20,48 +25,114 @@ using RoZwet.Tools.StoreProc.Infrastructure.Parsing;
 
 namespace RoZwet.Tools.StoreProc;
 
+internal sealed record AuthRequest(string? Password);
+
 internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
-        if (args.Length == 0)
-        {
-            PrintUsage();
-            return 1;
-        }
+        var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "--web";
 
-        var mode = args[0].ToLowerInvariant();
-        if (mode is not ("--ingest" or "--chat" or "--mcp"))
+        if (mode is not ("--web" or "--ingest" or "--mcp"))
         {
             Console.Error.WriteLine($"Unknown mode: '{args[0]}'");
             PrintUsage();
             return 1;
         }
 
-        if (mode == "--mcp")
-            return await RunMcpAsync();
-
-        var host = BuildHost();
-        await host.StartAsync();
-
-        try
+        return mode switch
         {
-            return mode switch
+            "--mcp"    => await RunMcpAsync(),
+            "--ingest" => await RunIngestAsync(),
+            _          => await RunWebAsync()
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // AG-UI Web API — default mode (no args or --web).
+    // Serves wwwroot/index.html and exposes POST /chat as an AG-UI SSE endpoint.
+    // Protected by a password gate: POST /api/auth sets an HttpOnly session cookie.
+    // -------------------------------------------------------------------------
+    private static async Task<int> RunWebAsync()
+    {
+        var builder = WebApplication.CreateBuilder();
+
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+            .AddEnvironmentVariables(prefix: "ROZWET_");
+
+        var config = builder.Configuration;
+
+        RegisterNeo4j(builder.Services, config);
+        RegisterAiProviders(builder.Services, config);
+        RegisterApplicationServices(builder.Services, config);
+
+        builder.Services.AddAGUI();
+        builder.Services.AddHttpClient();
+
+        var app = builder.Build();
+
+        app.UseStaticFiles();
+
+        var expectedToken = ComputeSessionToken(RequireConfig(config, "Web:AccessPassword"));
+
+        // --- Zero-trust auth gate: protect /chat ---
+        app.Use(async (context, next) =>
+        {
+            if (context.Request.Path.StartsWithSegments("/chat", StringComparison.OrdinalIgnoreCase))
             {
-                "--ingest" => await RunIngestAsync(host.Services),
-                "--chat"   => await RunChatAsync(host.Services),
-                _          => 1
-            };
-        }
-        finally
+                if (!context.Request.Cookies.TryGetValue("__rzw_session", out var cookieVal) ||
+                    !string.Equals(cookieVal, expectedToken, StringComparison.Ordinal))
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    return;
+                }
+            }
+
+            await next(context);
+        });
+
+        // --- Auth endpoint ---
+        app.MapPost("/api/auth", (HttpContext ctx, AuthRequest req) =>
         {
-            await host.StopAsync();
-        }
+            var submitted = ComputeSessionToken(req.Password ?? string.Empty);
+            if (!string.Equals(submitted, expectedToken, StringComparison.Ordinal))
+                return Results.Unauthorized();
+
+            ctx.Response.Cookies.Append("__rzw_session", expectedToken, new CookieOptions
+            {
+                HttpOnly  = true,
+                SameSite  = SameSiteMode.Strict,
+                IsEssential = true,
+                Secure    = false   // localhost; set to true behind HTTPS reverse-proxy
+            });
+
+            return Results.Ok();
+        });
+
+        // --- AG-UI GraphRAG agent endpoint ---
+        var chatClient    = app.Services.GetRequiredService<IChatClient>();
+        var graphTools    = app.Services.GetRequiredService<GraphQueryTools>();
+        var loggerFactory = app.Services.GetRequiredService<ILoggerFactory>();
+
+        var agent = new ChatClientAgent(
+            chatClient,
+            "graphrag-assistant",
+            "GraphRAGAssistant",
+            ChatService.SystemPrompt,
+            graphTools.All.Cast<AITool>().ToList(),
+            loggerFactory,
+            app.Services);
+
+        app.MapAGUI("/chat", agent);
+
+        var url = config["Web:Url"] ?? "http://localhost:5000";
+        await app.RunAsync(url);
+        return 0;
     }
 
     // -------------------------------------------------------------------------
     // MCP HTTP server — listens on Mcp:Url (default http://localhost:3001).
-    // Connect Cline via: { "url": "http://localhost:3001/mcp" }
     // -------------------------------------------------------------------------
     private static async Task<int> RunMcpAsync()
     {
@@ -91,14 +162,15 @@ internal static class Program
     }
 
     // -------------------------------------------------------------------------
-    // Shared host used by --ingest and --chat modes.
+    // Ingestion pipeline — processes SQL source files into Neo4j.
     // -------------------------------------------------------------------------
-    private static IHost BuildHost() =>
-        Host.CreateDefaultBuilder()
-            .ConfigureAppConfiguration(config =>
+    private static async Task<int> RunIngestAsync()
+    {
+        var host = Host.CreateDefaultBuilder()
+            .ConfigureAppConfiguration(cfg =>
             {
-                config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: false);
-                config.AddEnvironmentVariables(prefix: "ROZWET_");
+                cfg.AddJsonFile("appsettings.json", optional: false, reloadOnChange: false);
+                cfg.AddEnvironmentVariables(prefix: "ROZWET_");
             })
             .ConfigureLogging(logging =>
             {
@@ -108,15 +180,55 @@ internal static class Program
             .ConfigureServices((ctx, services) =>
             {
                 var config = ctx.Configuration;
-
                 RegisterNeo4j(services, config);
                 RegisterAiProviders(services, config);
                 RegisterApplicationServices(services, config);
             })
             .Build();
 
+        await host.StartAsync();
+
+        try
+        {
+            var logger       = host.Services.GetRequiredService<ILogger<PipelineOrchestrator>>();
+            var orchestrator = host.Services.GetRequiredService<PipelineOrchestrator>();
+            var config       = host.Services.GetRequiredService<IConfiguration>();
+
+            var sqlDir    = config["Ingestion:SqlSourceDirectory"] ?? "./sql";
+            var batchSize = int.TryParse(config["Ingestion:BatchSize"], out var b) ? b : 50;
+
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) =>
+            {
+                e.Cancel = true;
+                logger.LogWarning("Cancellation requested. Finishing current batch before exiting...");
+                cts.Cancel();
+            };
+
+            try
+            {
+                await orchestrator.RunAsync(sqlDir, batchSize, cts.Token);
+                return 0;
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogWarning("Ingestion cancelled. Resume by re-running with --ingest.");
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                logger.LogCritical(ex, "Ingestion failed with an unhandled exception.");
+                return 2;
+            }
+        }
+        finally
+        {
+            await host.StopAsync();
+        }
+    }
+
     // -------------------------------------------------------------------------
-    // Service registrations — shared across all modes.
+    // Shared service registrations.
     // -------------------------------------------------------------------------
     private static void RegisterNeo4j(IServiceCollection services, IConfiguration config)
     {
@@ -148,13 +260,10 @@ internal static class Program
         });
 
         // Chat provider: native Gemini SDK — preserves thought_signature for thinking models.
-        // The OpenAI-compatible endpoint strips thought_signature, causing HTTP 400 on tool-result
-        // rounds when using any Gemini thinking model (e.g. gemini-3-flash-preview).
         services.AddSingleton<IChatClient>(_ =>
         {
             var apiKey    = RequireConfig(config, "Ai:Chat:ApiKey");
             var chatModel = RequireConfig(config, "Ai:Chat:Model");
-
             return new GeminiChatClient(apiKey: apiKey, model: chatModel);
         });
 
@@ -188,98 +297,11 @@ internal static class Program
     }
 
     // -------------------------------------------------------------------------
-    // Mode runners.
-    // -------------------------------------------------------------------------
-    private static async Task<int> RunIngestAsync(IServiceProvider services)
-    {
-        var logger       = services.GetRequiredService<ILogger<PipelineOrchestrator>>();
-        var orchestrator = services.GetRequiredService<PipelineOrchestrator>();
-        var config       = services.GetRequiredService<IConfiguration>();
-
-        var sqlDir    = config["Ingestion:SqlSourceDirectory"] ?? "./sql";
-        var batchSize = int.TryParse(config["Ingestion:BatchSize"], out var b) ? b : 50;
-
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) =>
-        {
-            e.Cancel = true;
-            logger.LogWarning("Cancellation requested. Finishing current batch before exiting...");
-            cts.Cancel();
-        };
-
-        try
-        {
-            await orchestrator.RunAsync(sqlDir, batchSize, cts.Token);
-            return 0;
-        }
-        catch (OperationCanceledException)
-        {
-            logger.LogWarning("Ingestion cancelled. Resume by re-running with --ingest.");
-            return 1;
-        }
-        catch (Exception ex)
-        {
-            logger.LogCritical(ex, "Ingestion failed with an unhandled exception.");
-            return 2;
-        }
-    }
-
-    private static async Task<int> RunChatAsync(IServiceProvider services)
-    {
-        var chatService = services.GetRequiredService<ChatService>();
-        var logger      = services.GetRequiredService<ILogger<ChatService>>();
-
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("=== RoZwet GraphRAG Chat ===");
-        Console.WriteLine("Type your question and press Enter. Type 'exit' to quit.");
-        Console.ResetColor();
-
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-
-        while (!cts.Token.IsCancellationRequested)
-        {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.Write("\nYou: ");
-            Console.ResetColor();
-
-            var input = Console.ReadLine();
-
-            if (input is null || input.Equals("exit", StringComparison.OrdinalIgnoreCase))
-                break;
-
-            if (string.IsNullOrWhiteSpace(input))
-                continue;
-
-            try
-            {
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("\nAssistant:");
-                Console.ResetColor();
-
-                var answer = await chatService.AskAsync(input, cts.Token);
-                Console.WriteLine(answer);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Error processing question.");
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Error: {ex.Message}");
-                Console.ResetColor();
-            }
-        }
-
-        Console.WriteLine("\nSession ended.");
-        return 0;
-    }
-
-    // -------------------------------------------------------------------------
     // Utilities.
     // -------------------------------------------------------------------------
+    private static string ComputeSessionToken(string password) =>
+        Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(password)));
+
     private static string RequireConfig(IConfiguration config, string key)
     {
         var value = config[key];
@@ -291,8 +313,9 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.WriteLine("Usage:");
-        Console.WriteLine("  RoZwet.Tools.StoreProc --ingest   Run the ingestion pipeline");
-        Console.WriteLine("  RoZwet.Tools.StoreProc --chat     Start the interactive chat session");
-        Console.WriteLine("  RoZwet.Tools.StoreProc --mcp      Start the MCP HTTP server (default: http://localhost:3001)");
+        Console.WriteLine("  RoZwet.Tools.StoreProc             Start the AG-UI web chat server (default)");
+        Console.WriteLine("  RoZwet.Tools.StoreProc --web       Start the AG-UI web chat server");
+        Console.WriteLine("  RoZwet.Tools.StoreProc --ingest    Run the ingestion pipeline");
+        Console.WriteLine("  RoZwet.Tools.StoreProc --mcp       Start the MCP HTTP server");
     }
 }

@@ -1,7 +1,22 @@
-# Active Context — v1.8.0
+# Active Context — v1.9.0
 
 ## Current State
-All planned features through v1.8.0 are implemented and building clean (0 errors, 0 warnings).
+All planned features through v1.9.0 are implemented and building clean (0 errors, 0 warnings).
+
+## Completed Milestones
+
+### v1.9.0 — AG-UI Web Chat Interface
+- **Problem:** Chat was console-only (`--chat` mode); no web UI for real-time streaming interaction.
+- **Solution:** Convert to `Microsoft.NET.Sdk.Web`, add AG-UI protocol support via `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore`.
+- Changes:
+  - `RoZwet.Tools.StoreProc.csproj`: SDK upgraded to `Microsoft.NET.Sdk.Web`; added `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore 1.0.0-preview.260304.1`; `Microsoft.Extensions.AI` upgraded to `10.3.0`; `OutputType Exe` and explicit `FrameworkReference` removed (implicit in Web SDK).
+  - `Program.cs`: `--chat` mode and `RunChatAsync` removed; `--web` / no-args → `RunWebAsync`; uses `AddAGUI()` + `MapAGUI("/chat", agent)` from Microsoft Agent Framework; `/api/auth` endpoint issues `HttpOnly SameSite=Strict` session cookie (SHA-256 token); middleware guards `/chat` against unauthenticated requests; `ChatClientAgent` constructed with existing `GeminiChatClient` + `GraphQueryTools.All` + `ChatService.SystemPrompt`.
+  - `ChatService.cs`: `SystemPrompt` promoted from `private const` to `internal const` for access by `Program.cs`.
+  - `appsettings.json`: Added `Web:Url` (`http://localhost:5000`) and `Web:AccessPassword` (`changeme`).
+  - `wwwroot/index.html`: Self-contained vanilla-JS AG-UI SSE chat client; Design tokens (primary `#5B2D8E`, accent `#F0A030`); password overlay on first load; real-time token streaming via `fetch` + `ReadableStream`; AG-UI event parsing (`TEXT_MESSAGE_CONTENT` delta); conversation history maintained for multi-turn context; Dutch UI copy.
+  - `Properties/launchSettings.json`: Three profiles — `Web (AG-UI)`, `MCP`, `Ingest`.
+- Mode dispatch: no-args/`--web` → web server; `--ingest` → pipeline; `--mcp` → MCP server.
+
 
 ## Completed Milestones
 

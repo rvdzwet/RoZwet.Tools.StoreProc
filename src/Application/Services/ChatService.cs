@@ -14,7 +14,7 @@ namespace RoZwet.Tools.StoreProc.Application.Services;
 /// </summary>
 internal sealed class ChatService
 {
-    private const string SystemPrompt = """
+    internal const string SystemPrompt = """
         You are an expert database engineer specializing in Sybase stored procedure analysis.
         You have access to tools that query a Neo4j graph database containing thousands of
         stored procedures with semantic embeddings and dependency relationships.

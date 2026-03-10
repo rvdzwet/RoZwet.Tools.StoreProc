@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RoZwet GraphRAG — Stored Procedure Intelligence</title>
+  <style>
+    /* ------------------------------------------------------------------ */
+    /* Design tokens — Design tokens                            */
+    /* ------------------------------------------------------------------ */
+    :root {
+      --clr-primary:       #5B2D8E;
+      --clr-primary-dark:  #3D1A6B;
+      --clr-primary-light: #7B4AB4;
+      --clr-accent:        #F0A030;
+      --clr-accent-hover:  #D48A20;
+      --clr-bg:            #FFFFFF;
+      --clr-surface:       #F5F1FB;
+      --clr-text:          #1A1A2E;
+      --clr-text-muted:    #6B6B8A;
+      --clr-border:        #DDD5F0;
+      --clr-user-bubble:   #EDE8FA;
+      --clr-error:         #C0392B;
+      --font:              -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --radius:            8px;
+      --radius-bubble:     16px;
+      --shadow:            0 2px 12px rgba(91,45,142,0.12);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      font-family: var(--font);
+      background: var(--clr-bg);
+      color: var(--clr-text);
+      overflow: hidden;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Password overlay                                                     */
+    /* ------------------------------------------------------------------ */
+    #auth-overlay {
+      position: fixed;
+      inset: 0;
+      background: linear-gradient(145deg, var(--clr-primary-dark) 0%, var(--clr-primary) 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    #auth-box {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 16px;
+      padding: 48px 40px 40px;
+      width: 100%;
+      max-width: 400px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+      text-align: center;
+    }
+
+    #auth-box .logo-text {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.25em;
+      color: rgba(255,255,255,0.55);
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    #auth-box h1 {
+      color: #FFFFFF;
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    #auth-box p {
+      color: rgba(255,255,255,0.65);
+      font-size: 14px;
+      margin-bottom: 32px;
+    }
+
+    #auth-box input[type="password"] {
+      width: 100%;
+      padding: 14px 18px;
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: var(--radius);
+      background: rgba(255,255,255,0.12);
+      color: #FFFFFF;
+      font-size: 16px;
+      outline: none;
+      margin-bottom: 16px;
+      transition: border-color 0.2s;
+    }
+
+    #auth-box input[type="password"]::placeholder { color: rgba(255,255,255,0.4); }
+    #auth-box input[type="password"]:focus { border-color: var(--clr-accent); }
+
+    #auth-box button {
+      width: 100%;
+      padding: 14px;
+      background: var(--clr-accent);
+      color: var(--clr-primary-dark);
+      font-size: 15px;
+      font-weight: 700;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+      letter-spacing: 0.03em;
+    }
+
+    #auth-box button:hover  { background: var(--clr-accent-hover); }
+    #auth-box button:active { transform: scale(0.98); }
+
+    #auth-error {
+      color: #FFB3B3;
+      font-size: 13px;
+      margin-top: 12px;
+      min-height: 18px;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* App shell                                                           */
+    /* ------------------------------------------------------------------ */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* Header */
+    #header {
+      background: var(--clr-primary);
+      color: #FFFFFF;
+      padding: 0 24px;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-shrink: 0;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+
+    #header .brand {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.2;
+    }
+
+    #header .brand-name {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.9);
+    }
+
+    #header .brand-sub {
+      font-size: 11px;
+      color: rgba(255,255,255,0.5);
+      letter-spacing: 0.05em;
+    }
+
+    #header .divider {
+      width: 1px;
+      height: 28px;
+      background: rgba(255,255,255,0.2);
+    }
+
+    #header .title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #FFFFFF;
+      flex: 1;
+    }
+
+    #header .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #A0A0B8;
+      transition: background 0.3s;
+    }
+
+    #header .status-dot.active { background: #4CAF50; }
+    #header .status-dot.thinking { background: var(--clr-accent); animation: pulse 1s infinite; }
+
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* Chat area */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      background: var(--clr-bg);
+      scroll-behavior: smooth;
+    }
+
+    #messages::-webkit-scrollbar { width: 6px; }
+    #messages::-webkit-scrollbar-track { background: transparent; }
+    #messages::-webkit-scrollbar-thumb { background: var(--clr-border); border-radius: 3px; }
+
+    .msg {
+      display: flex;
+      flex-direction: column;
+      max-width: 780px;
+    }
+
+    .msg.user  { align-self: flex-end; align-items: flex-end; }
+    .msg.assistant { align-self: flex-start; align-items: flex-start; }
+
+    .msg-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--clr-text-muted);
+      margin-bottom: 5px;
+      padding: 0 4px;
+    }
+
+    .msg-bubble {
+      padding: 12px 18px;
+      border-radius: var(--radius-bubble);
+      font-size: 15px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .msg.user .msg-bubble {
+      background: var(--clr-user-bubble);
+      color: var(--clr-text);
+      border-bottom-right-radius: 4px;
+    }
+
+    .msg.assistant .msg-bubble {
+      background: var(--clr-bg);
+      border: 1px solid var(--clr-border);
+      border-left: 4px solid var(--clr-primary);
+      color: var(--clr-text);
+      border-bottom-left-radius: 4px;
+      box-shadow: var(--shadow);
+    }
+
+    /* Typing indicator */
+    .typing-indicator {
+      display: flex;
+      gap: 5px;
+      padding: 16px 18px;
+      background: var(--clr-bg);
+      border: 1px solid var(--clr-border);
+      border-left: 4px solid var(--clr-primary);
+      border-radius: var(--radius-bubble);
+      border-bottom-left-radius: 4px;
+      width: fit-content;
+      box-shadow: var(--shadow);
+    }
+
+    .typing-indicator span {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--clr-primary-light);
+      animation: bounce 1.2s infinite;
+    }
+
+    .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+    @keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-6px)} }
+
+    /* Tool call notice */
+    .tool-notice {
+      font-size: 12px;
+      color: var(--clr-text-muted);
+      padding: 6px 12px;
+      background: var(--clr-surface);
+      border-radius: 20px;
+      align-self: flex-start;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tool-notice::before { content: "⚙"; font-size: 13px; }
+
+    /* Input bar */
+    #input-bar {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      padding: 16px 20px;
+      border-top: 1px solid var(--clr-border);
+      background: var(--clr-surface);
+      flex-shrink: 0;
+    }
+
+    #user-input {
+      flex: 1;
+      resize: none;
+      border: 1px solid var(--clr-border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      font-size: 15px;
+      font-family: var(--font);
+      color: var(--clr-text);
+      background: var(--clr-bg);
+      outline: none;
+      line-height: 1.5;
+      max-height: 160px;
+      overflow-y: auto;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    #user-input:focus {
+      border-color: var(--clr-primary-light);
+      box-shadow: 0 0 0 3px rgba(91,45,142,0.12);
+    }
+
+    #user-input::placeholder { color: var(--clr-text-muted); }
+
+    #send-btn {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: var(--clr-accent);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    #send-btn:hover:not(:disabled)  { background: var(--clr-accent-hover); }
+    #send-btn:active:not(:disabled) { transform: scale(0.95); }
+    #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #send-btn svg { fill: var(--clr-primary-dark); width: 20px; height: 20px; }
+
+    /* Welcome message */
+    .welcome {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--clr-text-muted);
+    }
+
+    .welcome h2 {
+      font-size: 22px;
+      color: var(--clr-primary-dark);
+      margin-bottom: 10px;
+    }
+
+    .welcome p { font-size: 14px; line-height: 1.6; max-width: 460px; margin: 0 auto; }
+
+    /* Error banner */
+    #error-banner {
+      display: none;
+      background: #FFF0F0;
+      border-top: 3px solid var(--clr-error);
+      color: var(--clr-error);
+      font-size: 13px;
+      padding: 10px 20px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Password gate -->
+<div id="auth-overlay">
+  <div id="auth-box">
+    <div class="logo-text">RoZwet</div>
+    <h1>GraphRAG Intelligence</h1>
+    <p>Geef het toegangswachtwoord op om te beginnen</p>
+    <input type="password" id="password-input" placeholder="Wachtwoord" autocomplete="current-password" />
+    <button id="login-btn" onclick="doLogin()">Toegang</button>
+    <div id="auth-error"></div>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <div id="header">
+    <div class="brand">
+      <span class="brand-name">RoZwet</span>
+      <span class="brand-sub">GraphRAG</span>
+    </div>
+    <div class="divider"></div>
+    <span class="title">GraphRAG — Stored Procedure Intelligence</span>
+    <div id="status-dot" class="status-dot" title="Status"></div>
+  </div>
+
+  <div id="messages">
+    <div class="welcome">
+      <h2>Welkom bij de GraphRAG Assistent</h2>
+      <p>Stel vragen over opgeslagen procedures, afhankelijkheden en tabelgebruik in de Sybase kennisbank. De assistent zoekt automatisch door de graph en geeft u een nauwkeurig antwoord.</p>
+    </div>
+  </div>
+
+  <div id="error-banner" id="error-banner"></div>
+
+  <div id="input-bar">
+    <textarea
+      id="user-input"
+      rows="1"
+      placeholder="Stel een vraag over stored procedures, tabellen of afhankelijkheden..."
+      onkeydown="handleKey(event)"
+      oninput="autoResize(this)"
+    ></textarea>
+    <button id="send-btn" onclick="sendMessage()" title="Verstuur (Enter)">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
+<script>
+  /* ------------------------------------------------------------------ */
+  /* State                                                                */
+  /* ------------------------------------------------------------------ */
+  const threadId   = crypto.randomUUID();
+  const messages   = [];   // AG-UI message history
+  let   isRunning  = false;
+
+  /* ------------------------------------------------------------------ */
+  /* Auth                                                                 */
+  /* ------------------------------------------------------------------ */
+  async function doLogin() {
+    const pw  = document.getElementById('password-input').value;
+    const err = document.getElementById('auth-error');
+    const btn = document.getElementById('login-btn');
+
+    err.textContent = '';
+    btn.disabled    = true;
+    btn.textContent = 'Bezig...';
+
+    try {
+      const res = await fetch('/api/auth', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ password: pw })
+      });
+
+      if (res.ok) {
+        document.getElementById('auth-overlay').style.display = 'none';
+        document.getElementById('user-input').focus();
+      } else {
+        err.textContent  = 'Onjuist wachtwoord. Probeer opnieuw.';
+        btn.disabled     = false;
+        btn.textContent  = 'Toegang';
+        document.getElementById('password-input').value = '';
+        document.getElementById('password-input').focus();
+      }
+    } catch {
+      err.textContent = 'Verbindingsfout. Controleer de server.';
+      btn.disabled    = false;
+      btn.textContent = 'Toegang';
+    }
+  }
+
+  /* Allow Enter key in password field */
+  document.getElementById('password-input')
+    .addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+  /* ------------------------------------------------------------------ */
+  /* Chat                                                                 */
+  /* ------------------------------------------------------------------ */
+  function handleKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+
+  function autoResize(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  }
+
+  function setStatus(state) {
+    const dot = document.getElementById('status-dot');
+    dot.className = 'status-dot ' + state;
+  }
+
+  function showError(msg) {
+    const banner = document.getElementById('error-banner');
+    banner.textContent = msg;
+    banner.style.display = 'block';
+    setTimeout(() => { banner.style.display = 'none'; }, 6000);
+  }
+
+  function appendUserBubble(text) {
+    const msgs = document.getElementById('messages');
+
+    // Remove welcome if first message
+    const welcome = msgs.querySelector('.welcome');
+    if (welcome) welcome.remove();
+
+    const wrap = document.createElement('div');
+    wrap.className = 'msg user';
+    wrap.innerHTML = `
+      <div class="msg-label">U</div>
+      <div class="msg-bubble">${escapeHtml(text)}</div>`;
+    msgs.appendChild(wrap);
+    scrollToBottom();
+  }
+
+  function appendTypingIndicator() {
+    const msgs = document.getElementById('messages');
+    const wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    wrap.id = 'typing-wrap';
+    wrap.innerHTML = `
+      <div class="msg-label">Assistent</div>
+      <div class="typing-indicator"><span></span><span></span><span></span></div>`;
+    msgs.appendChild(wrap);
+    scrollToBottom();
+    return wrap;
+  }
+
+  function replaceTypingWithBubble(typingWrap) {
+    typingWrap.querySelector('.typing-indicator').remove();
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.id        = 'current-bubble';
+    typingWrap.appendChild(bubble);
+    return bubble;
+  }
+
+  function appendToolNotice(toolName) {
+    const msgs = document.getElementById('messages');
+    const notice = document.createElement('div');
+    notice.className = 'msg assistant';
+    notice.innerHTML = `<div class="tool-notice">Tool: ${escapeHtml(toolName)}</div>`;
+    msgs.appendChild(notice);
+    scrollToBottom();
+  }
+
+  function scrollToBottom() {
+    const msgs = document.getElementById('messages');
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function escapeHtml(text) {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  async function sendMessage() {
+    if (isRunning) return;
+
+    const input = document.getElementById('user-input');
+    const text  = input.value.trim();
+    if (!text) return;
+
+    isRunning = true;
+    document.getElementById('send-btn').disabled = true;
+    input.value = '';
+    input.style.height = 'auto';
+
+    // Add user message to history
+    const userMsgId = crypto.randomUUID();
+    messages.push({
+      id:        userMsgId,
+      role:      'user',
+      content:   text,
+      createdAt: Math.floor(Date.now() / 1000)
+    });
+
+    appendUserBubble(text);
+    setStatus('thinking');
+
+    const typingWrap  = appendTypingIndicator();
+    let   bubble      = null;
+    let   assistantText = '';
+    const assistantMsgId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+
+    try {
+      const response = await fetch('/chat', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          threadId,
+          runId,
+          messages,
+          tools:          [],
+          context:        [],
+          state:          null,
+          forwardedProps: {}
+        })
+      });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          document.getElementById('auth-overlay').style.display = 'flex';
+          typingWrap.remove();
+          messages.pop();
+          return;
+        }
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const reader  = response.body.getReader();
+      const decoder = new TextDecoder();
+      let   buffer  = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete last line
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (!raw || raw === '[DONE]') continue;
+
+          let event;
+          try { event = JSON.parse(raw); } catch { continue; }
+
+          switch (event.type) {
+            case 'TEXT_MESSAGE_START':
+              bubble = replaceTypingWithBubble(typingWrap);
+              break;
+
+            case 'TEXT_MESSAGE_CONTENT':
+              if (!bubble) bubble = replaceTypingWithBubble(typingWrap);
+              assistantText += event.delta ?? '';
+              bubble.textContent = assistantText;
+              scrollToBottom();
+              break;
+
+            case 'TOOL_CALL_START':
+              appendToolNotice(event.toolCallName ?? 'tool');
+              break;
+
+            case 'TEXT_MESSAGE_END':
+            case 'RUN_FINISHED':
+              // Add assistant response to history
+              if (assistantText) {
+                messages.push({
+                  id:   assistantMsgId,
+                  role: 'assistant',
+                  content: [{ type: 'text', text: assistantText }]
+                });
+              }
+              break;
+
+            case 'RUN_ERROR':
+              showError('Agent fout: ' + (event.message ?? 'Onbekende fout'));
+              if (!bubble) replaceTypingWithBubble(typingWrap);
+              break;
+          }
+        }
+      }
+
+      // If no bubble was ever created (empty response), clean up
+      if (!bubble) typingWrap.remove();
+
+    } catch (err) {
+      typingWrap.remove();
+      showError('Verbindingsfout: ' + err.message);
+      messages.pop(); // remove failed user message from history
+    } finally {
+      isRunning = false;
+      document.getElementById('send-btn').disabled = false;
+      setStatus('active');
+      scrollToBottom();
+    }
+  }
+</script>
+</body>
+</html>

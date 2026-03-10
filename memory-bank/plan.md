@@ -1,6 +1,54 @@
 # ARCHITECTURAL PLAN: RoZwet.Tools.StoreProc — GraphRAG Stored Procedure Intelligence System
 
-## Version: 1.8.0 | Status: ACTIVE
+## Version: 1.9.0 | Status: ACTIVE
+
+---
+
+## PHASE 6 — AG-UI Web Chat Interface (v1.9.0)
+
+### Overview
+Convert the console `--chat` mode to a browser-based AG-UI chat endpoint with real-time SSE streaming, a password-gated password-gated UI, and the Microsoft Agent Framework.
+
+### Project Changes
+
+| File | Change |
+|---|---|
+| `RoZwet.Tools.StoreProc.csproj` | SDK → `Microsoft.NET.Sdk.Web`; added `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore 1.0.0-preview.260304.1`; ME.AI upgraded to `10.3.0` |
+| `Program.cs` | `--chat`/`RunChatAsync` removed; `--web`/no-args → `RunWebAsync`; `AddAGUI()` + `MapAGUI("/chat", agent)`; `/api/auth` with SHA-256 cookie token; auth middleware protects `/chat` |
+| `src/Application/Services/ChatService.cs` | `SystemPrompt` promoted to `internal const` |
+| `appsettings.json` | `Web:Url` + `Web:AccessPassword` added |
+| `wwwroot/index.html` | Self-contained AG-UI SSE client; clean palette; Dutch UI; password overlay |
+| `Properties/launchSettings.json` | Three profiles: `Web (AG-UI)`, `MCP`, `Ingest` |
+
+### AG-UI Endpoint Design
+```
+POST /chat  (requires __rzw_session cookie)
+  ← RunAgentInput JSON: { threadId, runId, messages[], tools:[], context:[], state:null }
+  → text/event-stream SSE:
+      data: {"type":"RUN_STARTED",...}
+      data: {"type":"TEXT_MESSAGE_START",...}
+      data: {"type":"TEXT_MESSAGE_CONTENT","delta":"Hello"}
+      ...
+      data: {"type":"RUN_FINISHED",...}
+```
+
+### Auth Flow
+```
+POST /api/auth  { "password": "secret" }
+  → if SHA256(submitted) == SHA256(configured):
+      Set-Cookie: __rzw_session=<token>; HttpOnly; SameSite=Strict
+      200 OK
+  → else: 401 Unauthorized
+```
+
+### Mode Dispatch Table (v1.9.0)
+| CLI arg | Behaviour |
+|---|---|
+| *(none)* | Starts AG-UI web server on `Web:Url` |
+| `--web` | Starts AG-UI web server on `Web:Url` |
+| `--ingest` | Runs ingestion pipeline |
+| `--mcp` | Starts MCP HTTP server on `Mcp:Url` |
+
 
 ---
 

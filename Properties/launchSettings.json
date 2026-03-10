@@ -1,8 +1,19 @@
 {
   "profiles": {
-    "RoZwet.Tools.StoreProc": {
+    "Web (AG-UI)": {
       "commandName": "Project",
-      "commandLineArgs": "--mcp"
+      "applicationUrl": "http://localhost:5000",
+      "launchBrowser": true,
+      "launchUrl": "http://localhost:5000"
+    },
+    "MCP": {
+      "commandName": "Project",
+      "commandLineArgs": "--mcp",
+      "applicationUrl": "http://localhost:3001"
+    },
+    "Ingest": {
+      "commandName": "Project",
+      "commandLineArgs": "--ingest"
     }
   }
 }
