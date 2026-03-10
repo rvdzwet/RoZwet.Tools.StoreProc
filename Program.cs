@@ -210,44 +210,12 @@ internal static class Program
 
             try
             {
-                bool reasoningHeaderPrinted = false;
-                bool answerHeaderPrinted    = false;
-
-                void OnChunk(bool isReasoning, string chunk)
-                {
-                    if (isReasoning)
-                    {
-                        if (!reasoningHeaderPrinted)
-                        {
-                            Console.ForegroundColor = ConsoleColor.DarkGray;
-                            Console.WriteLine("\n[Thinking]");
-                            reasoningHeaderPrinted = true;
-                        }
-
-                        Console.ForegroundColor = ConsoleColor.DarkGray;
-                        Console.Write(chunk);
-                        Console.Out.Flush();
-                    }
-                    else
-                    {
-                        if (!answerHeaderPrinted)
-                        {
-                            Console.ResetColor();
-                            Console.ForegroundColor = ConsoleColor.Green;
-                            Console.WriteLine("\n\nAssistant:");
-                            Console.ResetColor();
-                            answerHeaderPrinted = true;
-                        }
-
-                        Console.Write(chunk);
-                        Console.Out.Flush();
-                    }
-                }
-
-                await chatService.AskStreamingAsync(input, OnChunk, cts.Token);
-
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("\nAssistant:");
                 Console.ResetColor();
-                Console.WriteLine();
+
+                var answer = await chatService.AskAsync(input, cts.Token);
+                Console.WriteLine(answer);
             }
             catch (OperationCanceledException)
             {

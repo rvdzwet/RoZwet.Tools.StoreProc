@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using RoZwet.Tools.StoreProc.Application.Agents;
 using RoZwet.Tools.StoreProc.Application.Contracts;
@@ -6,10 +7,15 @@ using RoZwet.Tools.StoreProc.Domain;
 namespace RoZwet.Tools.StoreProc.Application.Pipeline;
 
 /// <summary>
-/// Orchestrates the full ingestion pipeline for 5,500 stored procedures.
+/// Orchestrates the full ingestion pipeline for 5,500+ stored procedures.
 /// Durable: resumes from the last committed checkpoint if interrupted.
-/// Processes files in configurable batches, writing each batch to Neo4j
-/// before committing progress to disk.
+///
+/// Files are processed in configurable-width concurrent windows
+/// (<c>Ingestion:MaxConcurrency</c>, default 4).  Within each window all
+/// <see cref="SqlAnalysisAgent.AnalyzeAsync"/> calls — including any background
+/// AI repair — run in parallel.  Batch writes to Neo4j and checkpoint commits
+/// occur after each completed window, guaranteeing that the committed index
+/// always represents a contiguous, fully-resolved range of files.
 /// </summary>
 internal sealed class PipelineOrchestrator
 {
@@ -17,17 +23,20 @@ internal sealed class PipelineOrchestrator
     private readonly INeo4jRepository _repository;
     private readonly IngestionCheckpoint _checkpoint;
     private readonly ILogger<PipelineOrchestrator> _logger;
+    private readonly int _maxConcurrency;
 
     public PipelineOrchestrator(
         SqlAnalysisAgent analysisAgent,
         INeo4jRepository repository,
         IngestionCheckpoint checkpoint,
+        IConfiguration config,
         ILogger<PipelineOrchestrator> logger)
     {
-        _analysisAgent = analysisAgent;
-        _repository = repository;
-        _checkpoint = checkpoint;
-        _logger = logger;
+        _analysisAgent   = analysisAgent;
+        _repository      = repository;
+        _checkpoint      = checkpoint;
+        _logger          = logger;
+        _maxConcurrency  = int.TryParse(config["Ingestion:MaxConcurrency"], out var c) && c > 0 ? c : 4;
     }
 
     /// <summary>
@@ -52,7 +61,9 @@ internal sealed class PipelineOrchestrator
             return;
         }
 
-        _logger.LogInformation("Discovered {Total} stored procedure files in '{Directory}'.", sqlFiles.Length, sqlDirectory);
+        _logger.LogInformation(
+            "Discovered {Total} stored procedure files in '{Directory}'. Concurrency={Concurrency}.",
+            sqlFiles.Length, sqlDirectory, _maxConcurrency);
 
         await _checkpoint.LoadAsync(cancellationToken);
 
@@ -68,7 +79,7 @@ internal sealed class PipelineOrchestrator
 
         var totalProcessed = Math.Max(0, _checkpoint.LastCommittedIndex + 1);
 
-        totalProcessed = await RetryPreviouslyFailedFilesAsync(totalProcessed, batchSize, cancellationToken);
+        totalProcessed = await RetryPreviouslyFailedFilesAsync(totalProcessed, cancellationToken);
 
         if (startIndex >= sqlFiles.Length)
         {
@@ -79,39 +90,48 @@ internal sealed class PipelineOrchestrator
         _logger.LogInformation(
             "Starting ingestion from file index {Start} / {Total}.",
             startIndex, sqlFiles.Length);
+
         var batchBuffer = new List<StoredProcedure>(batchSize);
 
-        for (int i = startIndex; i < sqlFiles.Length; i++)
+        for (int i = startIndex; i < sqlFiles.Length;)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var filePath = sqlFiles[i];
-            _logger.LogInformation("[{Current}/{Total}] Processing: {File}", i + 1, sqlFiles.Length, Path.GetFileName(filePath));
+            int windowSize = Math.Min(_maxConcurrency, sqlFiles.Length - i);
+            var windowTasks = new Task<StoredProcedure?>[windowSize];
 
-            StoredProcedure? procedure = null;
-
-            try
+            for (int w = 0; w < windowSize; w++)
             {
-                procedure = await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to analyze file '{FilePath}'. Skipping.", filePath);
-            }
-
-            if (procedure is not null)
-            {
-                batchBuffer.Add(procedure);
-            }
-            else
-            {
-                _checkpoint.RecordFailure(filePath);
+                var filePath   = sqlFiles[i + w];
+                var fileIndex  = i + w;
+                var fileNumber = fileIndex + 1;
+                _logger.LogInformation(
+                    "[{Current}/{Total}] Queuing: {File}",
+                    fileNumber, sqlFiles.Length, Path.GetFileName(filePath));
+                windowTasks[w] = AnalyzeFileSafeAsync(filePath, cancellationToken);
             }
 
-            bool isBatchFull = batchBuffer.Count >= batchSize;
-            bool isLastFile = i == sqlFiles.Length - 1;
+            var windowResults = await Task.WhenAll(windowTasks);
 
-            if (isBatchFull || isLastFile)
+            for (int w = 0; w < windowSize; w++)
+            {
+                var procedure = windowResults[w];
+                var filePath  = sqlFiles[i + w];
+
+                if (procedure is not null)
+                {
+                    batchBuffer.Add(procedure);
+                }
+                else
+                {
+                    _checkpoint.RecordFailure(filePath);
+                }
+            }
+
+            int lastIndexInWindow = i + windowSize - 1;
+            bool isLastWindow     = lastIndexInWindow == sqlFiles.Length - 1;
+
+            if (batchBuffer.Count >= batchSize || isLastWindow)
             {
                 if (batchBuffer.Count > 0)
                 {
@@ -125,11 +145,32 @@ internal sealed class PipelineOrchestrator
                     batchBuffer.Clear();
                 }
 
-                await _checkpoint.CommitAsync(i, totalProcessed, cancellationToken);
+                await _checkpoint.CommitAsync(lastIndexInWindow, totalProcessed, cancellationToken);
             }
+
+            i += windowSize;
         }
 
         _logger.LogInformation("Ingestion complete. {Total} procedures processed.", totalProcessed);
+    }
+
+    /// <summary>
+    /// Wraps <see cref="SqlAnalysisAgent.AnalyzeAsync"/> with exception isolation
+    /// so that a single file failure does not abort the entire concurrent window.
+    /// </summary>
+    private async Task<StoredProcedure?> AnalyzeFileSafeAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to analyze file '{FilePath}'. Skipping.", filePath);
+            return null;
+        }
     }
 
     /// <summary>
@@ -139,13 +180,13 @@ internal sealed class PipelineOrchestrator
     /// The scan-head index (<see cref="IngestionCheckpoint.LastCommittedIndex"/>) is
     /// not advanced during this pass — only <c>FailedFiles</c> and
     /// <paramref name="totalProcessed"/> are updated.
+    /// Retry analyses also run concurrently up to <c>MaxConcurrency</c>.
     /// </summary>
     private async Task<int> RetryPreviouslyFailedFilesAsync(
         int totalProcessed,
-        int batchSize,
         CancellationToken cancellationToken)
     {
-        var failedPaths = _checkpoint.FailedFilePaths;
+        var failedPaths = _checkpoint.FailedFilePaths.ToList();
         if (failedPaths.Count == 0)
             return totalProcessed;
 
@@ -153,57 +194,61 @@ internal sealed class PipelineOrchestrator
             "Retrying {Count} previously failed file(s) from checkpoint.",
             failedPaths.Count);
 
-        var retryBuffer = new List<StoredProcedure>(batchSize);
-        int recovered = 0;
+        var retryBuffer = new List<StoredProcedure>(failedPaths.Count);
+        int recovered   = 0;
         int stillFailing = 0;
 
-        foreach (var filePath in failedPaths)
+        for (int i = 0; i < failedPaths.Count;)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (!File.Exists(filePath))
+            int windowSize = Math.Min(_maxConcurrency, failedPaths.Count - i);
+            var windowTasks = new Task<(string Path, StoredProcedure? Procedure)>[windowSize];
+
+            for (int w = 0; w < windowSize; w++)
             {
-                _logger.LogWarning("Previously failed file no longer exists on disk: '{FilePath}'. Removing from failures.", filePath);
-                _checkpoint.ClearFailure(filePath);
-                continue;
-            }
+                var fp = failedPaths[i + w];
 
-            _logger.LogInformation("[RETRY] {File}", Path.GetFileName(filePath));
-
-            StoredProcedure? procedure = null;
-
-            try
-            {
-                procedure = await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "[RETRY] Failed to analyze '{FilePath}'.", filePath);
-            }
-
-            if (procedure is not null)
-            {
-                retryBuffer.Add(procedure);
-                _checkpoint.ClearFailure(filePath);
-                recovered++;
-
-                if (retryBuffer.Count >= batchSize)
+                if (!File.Exists(fp))
                 {
-                    await _repository.UpsertBatchAsync(retryBuffer.AsReadOnly(), cancellationToken);
-                    totalProcessed += retryBuffer.Count;
-                    retryBuffer.Clear();
+                    _logger.LogWarning(
+                        "Previously failed file no longer exists on disk: '{FilePath}'. Removing from failures.", fp);
+                    _checkpoint.ClearFailure(fp);
+                    windowTasks[w] = Task.FromResult<(string, StoredProcedure?)>((fp, null));
+                    continue;
+                }
+
+                _logger.LogInformation("[RETRY] {File}", Path.GetFileName(fp));
+                windowTasks[w] = RetryFileAsync(fp, cancellationToken);
+            }
+
+            var windowResults = await Task.WhenAll(windowTasks);
+
+            foreach (var (fp, procedure) in windowResults)
+            {
+                if (procedure is not null)
+                {
+                    retryBuffer.Add(procedure);
+                    _checkpoint.ClearFailure(fp);
+                    recovered++;
+
+                    if (retryBuffer.Count >= _maxConcurrency)
+                    {
+                        await _repository.UpsertBatchAsync(retryBuffer.AsReadOnly(), cancellationToken);
+                        totalProcessed += retryBuffer.Count;
+                        retryBuffer.Clear();
+                        await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
+                    }
+                }
+                else if (!_checkpoint.FailedFilePaths.Contains(fp))
+                {
+                    _checkpoint.RecordFailure(fp);
+                    stillFailing++;
                     await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
                 }
             }
-            else
-            {
-                _checkpoint.RecordFailure(filePath);
-                stillFailing++;
 
-                // Commit the still-failing record immediately so it is never silently lost
-                // even if the process is killed before the retry pass completes.
-                await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
-            }
+            i += windowSize;
         }
 
         if (retryBuffer.Count > 0)
@@ -212,7 +257,6 @@ internal sealed class PipelineOrchestrator
             totalProcessed += retryBuffer.Count;
         }
 
-        // Final commit: flushes any pending clears for recovered files in the last partial batch.
         await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
 
         _logger.LogInformation(
@@ -220,5 +264,21 @@ internal sealed class PipelineOrchestrator
             recovered, stillFailing);
 
         return totalProcessed;
+    }
+
+    private async Task<(string Path, StoredProcedure? Procedure)> RetryFileAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var procedure = await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
+            return (filePath, procedure);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[RETRY] Failed to analyze '{FilePath}'.", filePath);
+            return (filePath, null);
+        }
     }
 }

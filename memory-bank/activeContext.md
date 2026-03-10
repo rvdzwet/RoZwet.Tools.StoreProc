@@ -1,12 +1,12 @@
 # ACTIVE CONTEXT: RoZwet.Tools.StoreProc
 
 ## Current Operation
-**v1.4.0 — Streaming Reasoning Output + Retry Durability Fix**
+**v1.5.0 — Tier-1 Preprocessor Extensions + Parallel AI Repair**
 
 ## State
 - Phase: Production Ready
 - Last Updated: 2026-03-10
-- Status: BUILD SUCCEEDED — Zero errors, zero warnings
+- Status: BUILD SUCCEEDED — Zero errors, zero warnings (binary locked by running process during verification; /t:Compile confirmed clean)
 
 ## Completed Steps — v1.1.0 Migration
 - [x] appsettings.json split into `Ai:Chat` (Gemini 3 Flash) + `Ai:Embedding` (voyage-4-large) + `Ai:Agent` sections

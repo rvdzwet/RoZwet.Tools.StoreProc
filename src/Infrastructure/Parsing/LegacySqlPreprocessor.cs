@@ -9,10 +9,12 @@ namespace RoZwet.Tools.StoreProc.Infrastructure.Parsing;
 /// Transformations applied (in order):
 /// <list type="number">
 ///   <item>
-///     <term>Legacy RAISERROR</term>
+///     <term>Legacy RAISERROR — space-separated, comma-separated, or bare</term>
 ///     <description>
-///       <c>RAISERROR &lt;msg_number&gt; &lt;expression&gt;</c>
-///       → <c>RAISERROR(&lt;expression&gt;, 16, 1)</c>
+///       <c>RAISERROR &lt;num&gt; &lt;expr&gt;</c>,
+///       <c>RAISERROR &lt;num&gt;, &lt;expr&gt;</c>, or
+///       <c>RAISERROR &lt;num&gt;</c>
+///       → <c>RAISERROR(&lt;expr_or_num&gt;, 16, 1)</c>.
 ///     </description>
 ///   </item>
 ///   <item>
@@ -59,6 +61,15 @@ namespace RoZwet.Tools.StoreProc.Infrastructure.Parsing;
 ///       <c>SET PROCID ON|OFF</c> is Sybase-only and stripped entirely.
 ///     </description>
 ///   </item>
+///   <item>
+///     <term>Sybase multi-assignment SET</term>
+///     <description>
+///       Sybase allows <c>SET @a = expr1, @b = expr2</c> (multiple variable assignments
+///       in one statement, comma-separated).  T-SQL 160 only permits one assignment per
+///       SET.  Converted to <c>SELECT @a = expr1, @b = expr2</c> which is semantically
+///       equivalent for scalar variable assignment and is valid in T-SQL 160.
+///     </description>
+///   </item>
 /// </list>
 ///
 /// The original SQL is never mutated — callers receive a new string.
@@ -67,8 +78,18 @@ namespace RoZwet.Tools.StoreProc.Infrastructure.Parsing;
 /// </summary>
 internal static class LegacySqlPreprocessor
 {
+    /// <summary>
+    /// Matches all three Sybase RAISERROR legacy forms:
+    /// <list type="bullet">
+    ///   <item><c>RAISERROR 20001 'message'</c>   — space-separated num + message</item>
+    ///   <item><c>RAISERROR 20001, 'message'</c>   — comma-separated num + message</item>
+    ///   <item><c>RAISERROR 20001</c>              — bare number, no message</item>
+    /// </list>
+    /// Group 1: the message number (used as fallback when no message is present).
+    /// Group 2: the message expression (optional).
+    /// </summary>
     private static readonly Regex LegacyRaiserrorPattern = new(
-        @"(?i)\bRAISERROR\s+\d+\s+(.+)",
+        @"(?i)\bRAISERROR\s+(\d+)(?:\s*,\s*|\s+)?(.*)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex ArithAbortNumericTruncationPattern = new(
@@ -81,10 +102,6 @@ internal static class LegacySqlPreprocessor
 
     /// <summary>
     /// Sybase left outer join: <c>expr1 *= expr2</c>.
-    /// Matches <c>*=</c> when preceded by a word character (column name/closing paren),
-    /// ensuring we do not corrupt the SQL Server compound assignment operator <c>*=</c>
-    /// used in SET statements (which would be <c>SET @var *= expr</c> — also neutralised
-    /// to <c>=</c> since we only need the table references, not the math).
     /// </summary>
     private static readonly Regex SybaseLeftOuterJoinPattern = new(
         @"\*=",
@@ -92,17 +109,13 @@ internal static class LegacySqlPreprocessor
 
     /// <summary>
     /// Sybase right outer join: <c>expr1 =* expr2</c>.
-    /// Matches <c>=*</c> only when followed by a non-equals character so that
-    /// <c>==</c> or normal assignments are not affected.
     /// </summary>
     private static readonly Regex SybaseRightOuterJoinPattern = new(
         @"=\*",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// Strips Sybase-specific cursor options that follow the SELECT body:
-    /// <c>FOR READ ONLY</c> and <c>FOR BROWSE</c>.
-    /// T-SQL 160 uses <c>READ_ONLY</c> inside the cursor declaration header, not here.
+    /// Strips Sybase-specific cursor options: <c>FOR READ ONLY</c> and <c>FOR BROWSE</c>.
     /// </summary>
     private static readonly Regex CursorForReadOnlyPattern = new(
         @"(?i)\bFOR\s+(?:READ\s+ONLY|BROWSE)\b[^\r\n]*",
@@ -119,6 +132,20 @@ internal static class LegacySqlPreprocessor
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
+    /// Converts Sybase multi-assignment <c>SET @a = e1, @b = e2</c> to
+    /// T-SQL-compatible <c>SELECT @a = e1, @b = e2</c>.
+    ///
+    /// Detection: a <c>SET</c> keyword (word boundary, case-insensitive) followed by
+    /// a variable assignment (<c>@identifier =</c>) that contains at least one comma
+    /// before the next assignment (<c>, @identifier =</c>).  Only the keyword is
+    /// replaced — the rest of the statement is preserved verbatim so that complex
+    /// expressions (function calls, sub-selects) are not disturbed.
+    /// </summary>
+    private static readonly Regex SybaseMultiSetPattern = new(
+        @"(?i)\bSET\s+(@\w+\s*=\s*[^@\r\n]+,\s*@\w+\s*=)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
     /// Returns a version of <paramref name="sql"/> with legacy Sybase syntax
     /// normalised to modern T-SQL that <c>TSql160Parser</c> accepts.
     /// </summary>
@@ -128,8 +155,11 @@ internal static class LegacySqlPreprocessor
     {
         var result = LegacyRaiserrorPattern.Replace(sql, static m =>
         {
-            var expression = m.Groups[1].Value.TrimEnd();
-            return $"RAISERROR({expression}, 16, 1)";
+            var msgNumber  = m.Groups[1].Value.Trim();
+            var expression = m.Groups[2].Value.Trim();
+
+            var payload = string.IsNullOrEmpty(expression) ? msgNumber : expression;
+            return $"RAISERROR({payload}, 16, 1)";
         });
 
         result = ArithAbortNumericTruncationPattern.Replace(result, string.Empty);
@@ -145,6 +175,7 @@ internal static class LegacySqlPreprocessor
         result = CursorForReadOnlyPattern.Replace(result, string.Empty);
         result = SetShowplanPattern.Replace(result, string.Empty);
         result = SetProcidPattern.Replace(result, string.Empty);
+        result = SybaseMultiSetPattern.Replace(result, static m => "SELECT " + m.Groups[1].Value);
 
         return result;
     }
