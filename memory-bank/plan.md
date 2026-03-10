@@ -1,6 +1,6 @@
 # ARCHITECTURAL PLAN: RoZwet.Tools.StoreProc — GraphRAG Stored Procedure Intelligence System
 
-## Version: 1.5.0 | Status: ACTIVE
+## Version: 1.6.0 | Status: ACTIVE
 
 ---
 

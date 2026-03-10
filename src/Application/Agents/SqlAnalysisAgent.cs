@@ -7,20 +7,34 @@ using RoZwet.Tools.StoreProc.Infrastructure.Parsing;
 namespace RoZwet.Tools.StoreProc.Application.Agents;
 
 /// <summary>
-/// Agent responsible for the full analysis pipeline of a single SQL file:
-/// parse the AST, extract dependencies, and generate a semantic embedding.
+/// The result of a Tier-1 (deterministic) parse attempt against a SQL file.
+/// </summary>
+/// <param name="Success">True when the AST was produced with zero parse errors.</param>
+/// <param name="Procedure">Populated domain aggregate when <paramref name="Success"/> is true.</param>
+/// <param name="OriginalSql">Raw SQL as read from disk.</param>
+/// <param name="NormalizedSql">SQL after <see cref="LegacySqlPreprocessor"/> transforms.</param>
+/// <param name="Errors">Parse errors remaining after Tier-1; non-empty when <paramref name="Success"/> is false.</param>
+internal sealed record Tier1Result(
+    bool Success,
+    StoredProcedure? Procedure,
+    string OriginalSql,
+    string NormalizedSql,
+    IList<ParseError> Errors);
+
+/// <summary>
+/// Agent responsible for the analysis pipeline of a single SQL file.
 ///
 /// Parse resilience follows a two-tier strategy:
 /// <list type="number">
 ///   <item>
 ///     Tier 1 — <see cref="LegacySqlPreprocessor"/> applies deterministic regex
 ///     transforms for known Sybase patterns before handing SQL to
-///     <c>TSql160Parser</c>.
+///     <c>TSql160Parser</c>.  Result available via <see cref="TryTier1Async"/>.
 ///   </item>
 ///   <item>
-///     Tier 2 — If parsing still fails, <see cref="AiSqlRepairAgent"/> sends the
-///     SQL and error messages to the configured LLM and retries parsing on the
-///     AI-repaired version.  The original SQL is always preserved for graph storage.
+///     Tier 2 — If Tier-1 still leaves parse errors, <see cref="AiSqlRepairAgent"/>
+///     sends the SQL to the LLM and retries.  Invoked via
+///     <see cref="RepairAndCompleteAsync"/> — intended to run as a background task.
 ///   </item>
 /// </list>
 ///
@@ -38,16 +52,16 @@ internal sealed class SqlAnalysisAgent
         ILogger<SqlAnalysisAgent> logger)
     {
         _embeddingProvider = embeddingProvider;
-        _repairAgent = repairAgent;
-        _logger = logger;
+        _repairAgent       = repairAgent;
+        _logger            = logger;
     }
 
     /// <summary>
-    /// Analyzes a stored procedure SQL file and returns a fully enriched domain aggregate.
-    /// Returns <see langword="null"/> if the file cannot be parsed as a valid stored procedure
-    /// even after AI-assisted repair.
+    /// Attempts Tier-1 parsing (deterministic only — no AI).
+    /// Returns immediately: success path builds the procedure scaffold;
+    /// failure path returns the normalized SQL and errors for the background repair agent.
     /// </summary>
-    public async Task<StoredProcedure?> AnalyzeAsync(
+    public async Task<Tier1Result> TryTier1Async(
         string sqlFilePath,
         CancellationToken cancellationToken = default)
     {
@@ -56,106 +70,157 @@ internal sealed class SqlAnalysisAgent
         if (string.IsNullOrWhiteSpace(sql))
         {
             _logger.LogWarning("Skipping empty file: {FilePath}", sqlFilePath);
-            return null;
+            return new Tier1Result(false, null, sql, sql, Array.Empty<ParseError>());
         }
 
-        var procedure = await ParseProcedureAsync(sql, sqlFilePath, cancellationToken);
-        if (procedure is null)
-            return null;
+        var normalizedSql = LegacySqlPreprocessor.Normalize(sql);
+        var parser        = new TSql160Parser(initialQuotedIdentifiers: true);
 
-        var embedding = await _embeddingProvider.GenerateAsync(sql, cancellationToken);
+        using var reader = new StringReader(normalizedSql);
+        var fragment     = parser.Parse(reader, out var errors);
+
+        if (errors.Count > 0)
+        {
+            _logger.LogInformation(
+                "Tier-1 left {Count} parse error(s) in '{File}'. First: {Msg}. Dispatching to background repair.",
+                errors.Count, Path.GetFileName(sqlFilePath), errors[0].Message);
+
+            return new Tier1Result(false, null, sql, normalizedSql, errors);
+        }
+
+        var procedure = BuildProcedure(fragment, sql, sqlFilePath);
+        if (procedure is null)
+        {
+            _logger.LogWarning(
+                "No CREATE PROCEDURE statement found in '{FilePath}'. Skipping.", sqlFilePath);
+            return new Tier1Result(false, null, sql, normalizedSql, errors);
+        }
+
+        return new Tier1Result(true, procedure, sql, normalizedSql, errors);
+    }
+
+    /// <summary>
+    /// Generates and applies a semantic embedding to an already-parsed procedure.
+    /// Mutates <paramref name="procedure"/> in place and returns the same instance.
+    /// </summary>
+    public async Task<StoredProcedure> ApplyEmbeddingAsync(
+        StoredProcedure procedure,
+        string originalSql,
+        CancellationToken cancellationToken = default)
+    {
+        var embedding = await _embeddingProvider.GenerateAsync(originalSql, cancellationToken);
         procedure.ApplyEmbedding(embedding);
 
         _logger.LogDebug(
-            "Analyzed '{Name}': {Calls} calls, {Tables} table deps, embedding applied.",
+            "Embedding applied to '{Name}': {Calls} calls, {Tables} table deps.",
             procedure.Name, procedure.Calls.Count, procedure.TableDependencies.Count);
 
         return procedure;
     }
 
-    private async Task<StoredProcedure?> ParseProcedureAsync(
-        string sql,
-        string filePath,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// Runs the Tier-2 AI repair loop, then builds the procedure aggregate and applies embedding.
+    /// Designed to be called as a fire-and-forget background task from
+    /// <c>PipelineOrchestrator</c>.
+    /// Returns <see langword="null"/> when AI repair is exhausted or produces an invalid AST.
+    /// </summary>
+    public async Task<StoredProcedure?> RepairAndCompleteAsync(
+        string sqlFilePath,
+        string normalizedSql,
+        IList<ParseError> errors,
+        string originalSql,
+        CancellationToken cancellationToken = default)
     {
-        var parser = new TSql160Parser(initialQuotedIdentifiers: true);
-        var normalizedSql = LegacySqlPreprocessor.Normalize(sql);
+        var parser     = new TSql160Parser(initialQuotedIdentifiers: true);
+        var currentSql = normalizedSql;
+        var currentErrors = errors;
+        TSqlFragment? fragment = null;
 
-        using var reader = new StringReader(normalizedSql);
-        var fragment = parser.Parse(reader, out var errors);
+        const int MaxRepairRounds = 10;
 
-        if (errors.Count > 0)
+        for (int round = 1; round <= MaxRepairRounds; round++)
         {
-            _logger.LogInformation(
-                "Tier-1 preprocessor left {Count} parse error(s) in '{FilePath}'. First: {First}. Escalating to AI repair.",
-                errors.Count, filePath, errors[0].Message);
+            cancellationToken.ThrowIfCancellationRequested();
 
-            const int MaxRepairRounds = 10;
-            var currentSql = normalizedSql;
+            var repairedSql = await _repairAgent.RepairAsync(
+                currentSql, currentErrors, round, MaxRepairRounds, cancellationToken);
 
-            for (int round = 1; round <= MaxRepairRounds; round++)
+            if (repairedSql is null)
             {
-                var repairedSql = await _repairAgent.RepairAsync(
-                    currentSql, errors, round, MaxRepairRounds, cancellationToken);
+                _logger.LogWarning(
+                    "[BG-REPAIR] AI returned null at round {Round}/{Max} for '{File}'. {Count} error(s) remain.",
+                    round, MaxRepairRounds, Path.GetFileName(sqlFilePath), currentErrors.Count);
+                break;
+            }
 
-                if (repairedSql is null)
-                {
-                    _logger.LogWarning(
-                        "AI repair returned null at round {Round}/{Max} for '{FilePath}'. {Count} error(s) remain. Stopping.",
-                        round, MaxRepairRounds, filePath, errors.Count);
-                    break;
-                }
+            using var repairedReader = new StringReader(repairedSql);
+            var repairedFragment     = parser.Parse(repairedReader, out var repairedErrors);
 
-                using var repairedReader = new StringReader(repairedSql);
-                var repairedFragment = parser.Parse(repairedReader, out var repairedErrors);
-                fragment = repairedFragment;
-
-                if (repairedErrors.Count == 0)
-                {
-                    _logger.LogInformation(
-                        "AI repair succeeded for '{FilePath}' after {Round} round(s): all parse errors resolved.",
-                        filePath, round);
-                    errors = repairedErrors;
-                    break;
-                }
-
-                if (repairedErrors.Count >= errors.Count)
-                {
-                    _logger.LogWarning(
-                        "AI repair stalled at round {Round}/{Max} for '{FilePath}': error count unchanged at {Count}. Stopping.",
-                        round, MaxRepairRounds, filePath, repairedErrors.Count);
-                    errors = repairedErrors;
-                    break;
-                }
-
+            if (repairedErrors.Count == 0)
+            {
                 _logger.LogInformation(
-                    "AI repair round {Round}/{Max}: errors {Before} → {After} in '{FilePath}'. Continuing.",
-                    round, MaxRepairRounds, errors.Count, repairedErrors.Count, filePath);
+                    "[BG-REPAIR] Succeeded for '{File}' after {Round} round(s).",
+                    Path.GetFileName(sqlFilePath), round);
+                fragment = repairedFragment;
+                currentErrors = repairedErrors;
+                break;
+            }
 
-                errors = repairedErrors;
-                currentSql = repairedSql;
+            if (repairedErrors.Count >= currentErrors.Count)
+            {
+                _logger.LogWarning(
+                    "[BG-REPAIR] Stalled at round {Round}/{Max} for '{File}': error count unchanged at {Count}.",
+                    round, MaxRepairRounds, Path.GetFileName(sqlFilePath), repairedErrors.Count);
+                fragment      = repairedFragment;
+                currentErrors = repairedErrors;
+                break;
+            }
 
-                if (round == MaxRepairRounds)
-                {
-                    _logger.LogWarning(
-                        "AI repair reached max {Max} rounds for '{FilePath}'. {Count} error(s) still remain. First: {First}.",
-                        MaxRepairRounds, filePath, errors.Count, errors[0].Message);
-                }
+            _logger.LogInformation(
+                "[BG-REPAIR] Round {Round}/{Max}: errors {Before} → {After} in '{File}'.",
+                round, MaxRepairRounds, currentErrors.Count, repairedErrors.Count,
+                Path.GetFileName(sqlFilePath));
+
+            fragment      = repairedFragment;
+            currentErrors = repairedErrors;
+            currentSql    = repairedSql;
+
+            if (round == MaxRepairRounds)
+            {
+                _logger.LogWarning(
+                    "[BG-REPAIR] Max {Max} rounds reached for '{File}'. {Count} error(s) remain.",
+                    MaxRepairRounds, Path.GetFileName(sqlFilePath), currentErrors.Count);
             }
         }
 
-        var createProc = FindCreateProcedureStatement(fragment);
-        if (createProc is null)
+        if (fragment is null || currentErrors.Count > 0)
+            return null;
+
+        var procedure = BuildProcedure(fragment, originalSql, sqlFilePath);
+        if (procedure is null)
         {
-            _logger.LogWarning("No CREATE PROCEDURE statement found in '{FilePath}'. Skipping.", filePath);
+            _logger.LogWarning(
+                "[BG-REPAIR] No CREATE PROCEDURE found in repaired AST for '{FilePath}'.", sqlFilePath);
             return null;
         }
 
-        var name = createProc.ProcedureReference?.Name?.BaseIdentifier?.Value
-                   ?? Path.GetFileNameWithoutExtension(filePath);
+        return await ApplyEmbeddingAsync(procedure, originalSql, cancellationToken);
+    }
+
+    private StoredProcedure? BuildProcedure(
+        TSqlFragment fragment,
+        string originalSql,
+        string filePath)
+    {
+        var createProc = FindCreateProcedureStatement(fragment);
+        if (createProc is null)
+            return null;
+
+        var name   = createProc.ProcedureReference?.Name?.BaseIdentifier?.Value
+                     ?? Path.GetFileNameWithoutExtension(filePath);
         var schema = createProc.ProcedureReference?.Name?.SchemaIdentifier?.Value ?? "dbo";
 
-        var procedure = new StoredProcedure(name, schema, sql);
+        var procedure = new StoredProcedure(name, schema, originalSql);
 
         var visitor = new StoredProcedureVisitor();
         fragment.Accept(visitor);

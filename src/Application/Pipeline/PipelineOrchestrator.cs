@@ -10,12 +10,24 @@ namespace RoZwet.Tools.StoreProc.Application.Pipeline;
 /// Orchestrates the full ingestion pipeline for 5,500+ stored procedures.
 /// Durable: resumes from the last committed checkpoint if interrupted.
 ///
-/// Files are processed in configurable-width concurrent windows
-/// (<c>Ingestion:MaxConcurrency</c>, default 4).  Within each window all
-/// <see cref="SqlAnalysisAgent.AnalyzeAsync"/> calls — including any background
-/// AI repair — run in parallel.  Batch writes to Neo4j and checkpoint commits
-/// occur after each completed window, guaranteeing that the committed index
-/// always represents a contiguous, fully-resolved range of files.
+/// Two-speed architecture:
+/// <list type="bullet">
+///   <item>
+///     <term>Fast path (Tier-1)</term> — sequential; deterministic parser runs at
+///     memory-speed.  Successful parses are embedding-enriched and batched to Neo4j.
+///     The committed index advances continuously.
+///   </item>
+///   <item>
+///     <term>Background path (Tier-2)</term> — files that fail Tier-1 are immediately
+///     recorded as failures in the checkpoint (durable), then dispatched as
+///     fire-and-forget tasks.  Each background task clears the failure and commits
+///     its result to Neo4j independently when it completes.
+///   </item>
+/// </list>
+///
+/// Thread safety: <see cref="_checkpointLock"/> (SemaphoreSlim(1,1)) serialises all
+/// concurrent <see cref="IngestionCheckpoint.CommitAsync"/> calls from background tasks
+/// and the main loop.
 /// </summary>
 internal sealed class PipelineOrchestrator
 {
@@ -23,7 +35,10 @@ internal sealed class PipelineOrchestrator
     private readonly INeo4jRepository _repository;
     private readonly IngestionCheckpoint _checkpoint;
     private readonly ILogger<PipelineOrchestrator> _logger;
-    private readonly int _maxConcurrency;
+    private readonly int _batchSize;
+
+    private readonly SemaphoreSlim _checkpointLock = new(1, 1);
+    private volatile int _totalProcessed;
 
     public PipelineOrchestrator(
         SqlAnalysisAgent analysisAgent,
@@ -32,11 +47,11 @@ internal sealed class PipelineOrchestrator
         IConfiguration config,
         ILogger<PipelineOrchestrator> logger)
     {
-        _analysisAgent   = analysisAgent;
-        _repository      = repository;
-        _checkpoint      = checkpoint;
-        _logger          = logger;
-        _maxConcurrency  = int.TryParse(config["Ingestion:MaxConcurrency"], out var c) && c > 0 ? c : 4;
+        _analysisAgent = analysisAgent;
+        _repository    = repository;
+        _checkpoint    = checkpoint;
+        _logger        = logger;
+        _batchSize     = int.TryParse(config["Ingestion:BatchSize"], out var b) && b > 0 ? b : 10;
     }
 
     /// <summary>
@@ -62,8 +77,8 @@ internal sealed class PipelineOrchestrator
         }
 
         _logger.LogInformation(
-            "Discovered {Total} stored procedure files in '{Directory}'. Concurrency={Concurrency}.",
-            sqlFiles.Length, sqlDirectory, _maxConcurrency);
+            "Discovered {Total} stored procedure files in '{Directory}'.",
+            sqlFiles.Length, sqlDirectory);
 
         await _checkpoint.LoadAsync(cancellationToken);
 
@@ -77,9 +92,9 @@ internal sealed class PipelineOrchestrator
 
         await _repository.EnsureSchemaAsync(cancellationToken);
 
-        var totalProcessed = Math.Max(0, _checkpoint.LastCommittedIndex + 1);
+        _totalProcessed = Math.Max(0, _checkpoint.LastCommittedIndex + 1);
 
-        totalProcessed = await RetryPreviouslyFailedFilesAsync(totalProcessed, cancellationToken);
+        _totalProcessed = await RetryPreviouslyFailedFilesAsync(_totalProcessed, cancellationToken);
 
         if (startIndex >= sqlFiles.Length)
         {
@@ -93,94 +108,150 @@ internal sealed class PipelineOrchestrator
 
         var batchBuffer = new List<StoredProcedure>(batchSize);
 
-        for (int i = startIndex; i < sqlFiles.Length;)
+        for (int i = startIndex; i < sqlFiles.Length; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            int windowSize = Math.Min(_maxConcurrency, sqlFiles.Length - i);
-            var windowTasks = new Task<StoredProcedure?>[windowSize];
+            var filePath   = sqlFiles[i];
+            var fileNumber = i + 1;
 
-            for (int w = 0; w < windowSize; w++)
+            _logger.LogInformation(
+                "[{Current}/{Total}] Parsing: {File}",
+                fileNumber, sqlFiles.Length, Path.GetFileName(filePath));
+
+            var tier1 = await _analysisAgent.TryTier1Async(filePath, cancellationToken);
+
+            if (tier1.Success && tier1.Procedure is not null)
             {
-                var filePath   = sqlFiles[i + w];
-                var fileIndex  = i + w;
-                var fileNumber = fileIndex + 1;
-                _logger.LogInformation(
-                    "[{Current}/{Total}] Queuing: {File}",
-                    fileNumber, sqlFiles.Length, Path.GetFileName(filePath));
-                windowTasks[w] = AnalyzeFileSafeAsync(filePath, cancellationToken);
-            }
+                var proc = await _analysisAgent.ApplyEmbeddingAsync(
+                    tier1.Procedure, tier1.OriginalSql, cancellationToken);
 
-            var windowResults = await Task.WhenAll(windowTasks);
+                batchBuffer.Add(proc);
 
-            for (int w = 0; w < windowSize; w++)
-            {
-                var procedure = windowResults[w];
-                var filePath  = sqlFiles[i + w];
+                bool isLast     = i == sqlFiles.Length - 1;
+                bool batchReady = batchBuffer.Count >= batchSize;
 
-                if (procedure is not null)
-                {
-                    batchBuffer.Add(procedure);
-                }
-                else
-                {
-                    _checkpoint.RecordFailure(filePath);
-                }
-            }
-
-            int lastIndexInWindow = i + windowSize - 1;
-            bool isLastWindow     = lastIndexInWindow == sqlFiles.Length - 1;
-
-            if (batchBuffer.Count >= batchSize || isLastWindow)
-            {
-                if (batchBuffer.Count > 0)
+                if (batchReady || isLast)
                 {
                     await _repository.UpsertBatchAsync(batchBuffer.AsReadOnly(), cancellationToken);
-                    totalProcessed += batchBuffer.Count;
+                    _totalProcessed += batchBuffer.Count;
 
                     _logger.LogInformation(
                         "Batch committed: {BatchCount} procedures. Total committed: {Total}/{Grand}.",
-                        batchBuffer.Count, totalProcessed, sqlFiles.Length);
+                        batchBuffer.Count, _totalProcessed, sqlFiles.Length);
 
                     batchBuffer.Clear();
+                    await CommitCheckpointSafeAsync(i, _totalProcessed, cancellationToken);
                 }
-
-                await _checkpoint.CommitAsync(lastIndexInWindow, totalProcessed, cancellationToken);
+                else
+                {
+                    await CommitCheckpointSafeAsync(i, _totalProcessed, cancellationToken);
+                }
             }
+            else
+            {
+                _checkpoint.RecordFailure(filePath);
+                await CommitCheckpointSafeAsync(i, _totalProcessed, cancellationToken);
 
-            i += windowSize;
+                _ = RepairInBackgroundAsync(filePath, tier1, cancellationToken);
+            }
         }
 
-        _logger.LogInformation("Ingestion complete. {Total} procedures processed.", totalProcessed);
+        if (batchBuffer.Count > 0)
+        {
+            await _repository.UpsertBatchAsync(batchBuffer.AsReadOnly(), cancellationToken);
+            _totalProcessed += batchBuffer.Count;
+            batchBuffer.Clear();
+
+            await CommitCheckpointSafeAsync(sqlFiles.Length - 1, _totalProcessed, cancellationToken);
+        }
+
+        _logger.LogInformation(
+            "Ingestion scan complete. {Total} procedures committed to Neo4j (background repairs may still be running).",
+            _totalProcessed);
     }
 
     /// <summary>
-    /// Wraps <see cref="SqlAnalysisAgent.AnalyzeAsync"/> with exception isolation
-    /// so that a single file failure does not abort the entire concurrent window.
+    /// Background fire-and-forget Tier-2 repair task.
+    /// On success: upserts to Neo4j, clears the failure entry, commits checkpoint.
+    /// On failure: leaves the file recorded as failed for the next retry pass.
     /// </summary>
-    private async Task<StoredProcedure?> AnalyzeFileSafeAsync(
+    private async Task RepairInBackgroundAsync(
         string filePath,
+        Tier1Result tier1,
         CancellationToken cancellationToken)
     {
         try
         {
-            return await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
+            _logger.LogInformation(
+                "[BG-REPAIR] Starting repair for '{File}'.", Path.GetFileName(filePath));
+
+            var proc = await _analysisAgent.RepairAndCompleteAsync(
+                filePath, tier1.NormalizedSql, tier1.Errors, tier1.OriginalSql, cancellationToken);
+
+            if (proc is null)
+            {
+                _logger.LogWarning(
+                    "[BG-REPAIR] Repair exhausted for '{File}'. File remains in FailedFiles.",
+                    Path.GetFileName(filePath));
+                return;
+            }
+
+            await _repository.UpsertBatchAsync([proc], cancellationToken);
+
+            await _checkpointLock.WaitAsync(cancellationToken);
+            try
+            {
+                _checkpoint.ClearFailure(filePath);
+                int total = Interlocked.Increment(ref _totalProcessed);
+                await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, total, cancellationToken);
+            }
+            finally
+            {
+                _checkpointLock.Release();
+            }
+
+            _logger.LogInformation(
+                "[BG-REPAIR] Committed repaired procedure '{File}'.", Path.GetFileName(filePath));
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation(
+                "[BG-REPAIR] Cancelled for '{File}'. File remains in FailedFiles for next run.",
+                Path.GetFileName(filePath));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to analyze file '{FilePath}'. Skipping.", filePath);
-            return null;
+            _logger.LogError(ex,
+                "[BG-REPAIR] Unhandled exception for '{FilePath}'. File remains in FailedFiles.",
+                filePath);
         }
     }
 
     /// <summary>
-    /// Re-processes every file that is recorded as failed in the current checkpoint.
-    /// Files that succeed are cleared from the failure list; files that still fail are
-    /// re-recorded so they remain visible in the checkpoint for operator inspection.
-    /// The scan-head index (<see cref="IngestionCheckpoint.LastCommittedIndex"/>) is
-    /// not advanced during this pass — only <c>FailedFiles</c> and
-    /// <paramref name="totalProcessed"/> are updated.
-    /// Retry analyses also run concurrently up to <c>MaxConcurrency</c>.
+    /// Thread-safe wrapper around <see cref="IngestionCheckpoint.CommitAsync"/>.
+    /// Ensures background tasks and the main loop never corrupt the checkpoint file.
+    /// </summary>
+    private async Task CommitCheckpointSafeAsync(
+        int lastCommittedIndex,
+        int totalProcessed,
+        CancellationToken cancellationToken)
+    {
+        await _checkpointLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _checkpoint.CommitAsync(lastCommittedIndex, totalProcessed, cancellationToken);
+        }
+        finally
+        {
+            _checkpointLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Re-processes every file recorded as failed in the current checkpoint.
+    /// Uses both Tier-1 and Tier-2 (awaited) since this pass is already the slow path.
+    /// Files that succeed are cleared; files that still fail are re-recorded.
     /// </summary>
     private async Task<int> RetryPreviouslyFailedFilesAsync(
         int totalProcessed,
@@ -194,91 +265,68 @@ internal sealed class PipelineOrchestrator
             "Retrying {Count} previously failed file(s) from checkpoint.",
             failedPaths.Count);
 
-        var retryBuffer = new List<StoredProcedure>(failedPaths.Count);
-        int recovered   = 0;
+        int recovered    = 0;
         int stillFailing = 0;
 
-        for (int i = 0; i < failedPaths.Count;)
+        foreach (var fp in failedPaths)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            int windowSize = Math.Min(_maxConcurrency, failedPaths.Count - i);
-            var windowTasks = new Task<(string Path, StoredProcedure? Procedure)>[windowSize];
-
-            for (int w = 0; w < windowSize; w++)
+            if (!File.Exists(fp))
             {
-                var fp = failedPaths[i + w];
-
-                if (!File.Exists(fp))
-                {
-                    _logger.LogWarning(
-                        "Previously failed file no longer exists on disk: '{FilePath}'. Removing from failures.", fp);
-                    _checkpoint.ClearFailure(fp);
-                    windowTasks[w] = Task.FromResult<(string, StoredProcedure?)>((fp, null));
-                    continue;
-                }
-
-                _logger.LogInformation("[RETRY] {File}", Path.GetFileName(fp));
-                windowTasks[w] = RetryFileAsync(fp, cancellationToken);
+                _logger.LogWarning(
+                    "Previously failed file no longer exists: '{FilePath}'. Removing from failures.", fp);
+                _checkpoint.ClearFailure(fp);
+                await CommitCheckpointSafeAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
+                continue;
             }
 
-            var windowResults = await Task.WhenAll(windowTasks);
+            _logger.LogInformation("[RETRY] {File}", Path.GetFileName(fp));
 
-            foreach (var (fp, procedure) in windowResults)
+            StoredProcedure? procedure = null;
+
+            try
             {
-                if (procedure is not null)
-                {
-                    retryBuffer.Add(procedure);
-                    _checkpoint.ClearFailure(fp);
-                    recovered++;
+                var tier1 = await _analysisAgent.TryTier1Async(fp, cancellationToken);
 
-                    if (retryBuffer.Count >= _maxConcurrency)
-                    {
-                        await _repository.UpsertBatchAsync(retryBuffer.AsReadOnly(), cancellationToken);
-                        totalProcessed += retryBuffer.Count;
-                        retryBuffer.Clear();
-                        await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
-                    }
-                }
-                else if (!_checkpoint.FailedFilePaths.Contains(fp))
+                if (tier1.Success && tier1.Procedure is not null)
                 {
-                    _checkpoint.RecordFailure(fp);
-                    stillFailing++;
-                    await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
+                    procedure = await _analysisAgent.ApplyEmbeddingAsync(
+                        tier1.Procedure, tier1.OriginalSql, cancellationToken);
+                }
+                else if (tier1.Errors.Count > 0)
+                {
+                    procedure = await _analysisAgent.RepairAndCompleteAsync(
+                        fp, tier1.NormalizedSql, tier1.Errors, tier1.OriginalSql, cancellationToken);
                 }
             }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[RETRY] Failed to analyze '{FilePath}'.", fp);
+            }
 
-            i += windowSize;
+            if (procedure is not null)
+            {
+                await _repository.UpsertBatchAsync([procedure], cancellationToken);
+                totalProcessed++;
+                _checkpoint.ClearFailure(fp);
+                recovered++;
+
+                _logger.LogInformation("[RETRY] Recovered '{File}'.", Path.GetFileName(fp));
+            }
+            else
+            {
+                _checkpoint.RecordFailure(fp);
+                stillFailing++;
+            }
+
+            await CommitCheckpointSafeAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
         }
-
-        if (retryBuffer.Count > 0)
-        {
-            await _repository.UpsertBatchAsync(retryBuffer.AsReadOnly(), cancellationToken);
-            totalProcessed += retryBuffer.Count;
-        }
-
-        await _checkpoint.CommitAsync(_checkpoint.LastCommittedIndex, totalProcessed, cancellationToken);
 
         _logger.LogInformation(
             "Retry pass complete: {Recovered} recovered, {StillFailing} still failing.",
             recovered, stillFailing);
 
         return totalProcessed;
-    }
-
-    private async Task<(string Path, StoredProcedure? Procedure)> RetryFileAsync(
-        string filePath,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            var procedure = await _analysisAgent.AnalyzeAsync(filePath, cancellationToken);
-            return (filePath, procedure);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[RETRY] Failed to analyze '{FilePath}'.", filePath);
-            return (filePath, null);
-        }
     }
 }
