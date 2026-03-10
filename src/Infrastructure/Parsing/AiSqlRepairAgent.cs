@@ -52,7 +52,9 @@ internal sealed class AiSqlRepairAgent
     ///   The SQL that failed parsing (already preprocessed by
     ///   <see cref="LegacySqlPreprocessor"/>).
     /// </param>
-    /// <param name="parseErrors">Errors from the first parse attempt.</param>
+    /// <param name="parseErrors">Errors from the current parse attempt.</param>
+    /// <param name="round">Current repair round (1-based), used for logging.</param>
+    /// <param name="maxRounds">Maximum repair rounds allowed, used for logging.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>
     ///   AI-repaired SQL string, or <see langword="null"/> if the repair call
@@ -61,6 +63,8 @@ internal sealed class AiSqlRepairAgent
     public async Task<string?> RepairAsync(
         string sql,
         IList<ParseError> parseErrors,
+        int round = 1,
+        int maxRounds = 10,
         CancellationToken cancellationToken = default)
     {
         var errorSummary = string.Join("; ", parseErrors
@@ -81,8 +85,8 @@ internal sealed class AiSqlRepairAgent
         try
         {
             _logger.LogInformation(
-                "AI repair invoked: {Count} error(s). Errors: [{Errors}]",
-                parseErrors.Count, errorSummary);
+                "AI repair invoked: round {Round}/{Max}, {Count} error(s). Errors: [{Errors}]",
+                round, maxRounds, parseErrors.Count, errorSummary);
 
             var repaired = await _chatProvider.CompleteAsync(
                 RepairSystemPrompt, userPrompt, cancellationToken);

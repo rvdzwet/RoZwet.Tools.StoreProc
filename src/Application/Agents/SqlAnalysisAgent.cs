@@ -90,34 +90,57 @@ internal sealed class SqlAnalysisAgent
                 "Tier-1 preprocessor left {Count} parse error(s) in '{FilePath}'. First: {First}. Escalating to AI repair.",
                 errors.Count, filePath, errors[0].Message);
 
-            var repairedSql = await _repairAgent.RepairAsync(normalizedSql, errors, cancellationToken);
+            const int MaxRepairRounds = 10;
+            var currentSql = normalizedSql;
 
-            if (repairedSql is not null)
+            for (int round = 1; round <= MaxRepairRounds; round++)
             {
+                var repairedSql = await _repairAgent.RepairAsync(
+                    currentSql, errors, round, MaxRepairRounds, cancellationToken);
+
+                if (repairedSql is null)
+                {
+                    _logger.LogWarning(
+                        "AI repair returned null at round {Round}/{Max} for '{FilePath}'. {Count} error(s) remain. Stopping.",
+                        round, MaxRepairRounds, filePath, errors.Count);
+                    break;
+                }
+
                 using var repairedReader = new StringReader(repairedSql);
                 var repairedFragment = parser.Parse(repairedReader, out var repairedErrors);
+                fragment = repairedFragment;
 
                 if (repairedErrors.Count == 0)
                 {
                     _logger.LogInformation(
-                        "AI repair succeeded for '{FilePath}': all parse errors resolved. Proceeding with repaired AST.",
-                        filePath);
-                    fragment = repairedFragment;
+                        "AI repair succeeded for '{FilePath}' after {Round} round(s): all parse errors resolved.",
+                        filePath, round);
                     errors = repairedErrors;
+                    break;
                 }
-                else
+
+                if (repairedErrors.Count >= errors.Count)
                 {
                     _logger.LogWarning(
-                        "AI repair for '{FilePath}' reduced errors from {Before} to {After}. Remaining: {First}. Proceeding with best-effort AST.",
-                        filePath, errors.Count, repairedErrors.Count, repairedErrors[0].Message);
-                    fragment = repairedFragment;
+                        "AI repair stalled at round {Round}/{Max} for '{FilePath}': error count unchanged at {Count}. Stopping.",
+                        round, MaxRepairRounds, filePath, repairedErrors.Count);
+                    errors = repairedErrors;
+                    break;
                 }
-            }
-            else
-            {
-                _logger.LogWarning(
-                    "AI repair unavailable for '{FilePath}'. Original {Count} parse error(s) remain. First: {First}. Proceeding with partial AST.",
-                    filePath, errors.Count, errors[0].Message);
+
+                _logger.LogInformation(
+                    "AI repair round {Round}/{Max}: errors {Before} → {After} in '{FilePath}'. Continuing.",
+                    round, MaxRepairRounds, errors.Count, repairedErrors.Count, filePath);
+
+                errors = repairedErrors;
+                currentSql = repairedSql;
+
+                if (round == MaxRepairRounds)
+                {
+                    _logger.LogWarning(
+                        "AI repair reached max {Max} rounds for '{FilePath}'. {Count} error(s) still remain. First: {First}.",
+                        MaxRepairRounds, filePath, errors.Count, errors[0].Message);
+                }
             }
         }
 
