@@ -36,6 +36,7 @@ internal sealed class ChatService
           exact identifiers such as procedure names and table names unchanged.
         """;
 
+
     private readonly IChatClient _chatClient;
     private readonly GraphQueryTools _tools;
     private readonly int _maxToolRounds;

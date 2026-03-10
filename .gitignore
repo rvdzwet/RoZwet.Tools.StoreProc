@@ -5,6 +5,9 @@ obj/
 ## Secrets — never commit
 appsettings.json
 
+## Operational memory bank — not for public consumption
+memory-bank/
+
 ## Runtime state — never commit
 checkpoint.json
 checkpoint.json.tmp

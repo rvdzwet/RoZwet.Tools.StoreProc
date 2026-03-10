@@ -45,5 +45,8 @@
   <ItemGroup>
     <Compile Remove="probe/**/*.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <Folder Include="Properties\PublishProfiles\" />
+  </ItemGroup>
 
 </Project>

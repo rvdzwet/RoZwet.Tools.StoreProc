@@ -1,12 +1,13 @@
 <!DOCTYPE html>
-<html lang="nl">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RoZwet GraphRAG — Stored Procedure Intelligence</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked@13/marked.min.js"></script>
   <style>
     /* ------------------------------------------------------------------ */
-    /* Design tokens — Design tokens                            */
+    /* Design tokens                                                        */
     /* ------------------------------------------------------------------ */
     :root {
       --clr-primary:       #5B2D8E;
@@ -60,15 +61,6 @@
       backdrop-filter: blur(12px);
       box-shadow: 0 8px 40px rgba(0,0,0,0.4);
       text-align: center;
-    }
-
-    #auth-box .logo-text {
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.25em;
-      color: rgba(255,255,255,0.55);
-      text-transform: uppercase;
-      margin-bottom: 8px;
     }
 
     #auth-box h1 {
@@ -146,32 +138,6 @@
       box-shadow: 0 2px 8px rgba(0,0,0,0.2);
     }
 
-    #header .brand {
-      display: flex;
-      flex-direction: column;
-      line-height: 1.2;
-    }
-
-    #header .brand-name {
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.25em;
-      text-transform: uppercase;
-      color: rgba(255,255,255,0.9);
-    }
-
-    #header .brand-sub {
-      font-size: 11px;
-      color: rgba(255,255,255,0.5);
-      letter-spacing: 0.05em;
-    }
-
-    #header .divider {
-      width: 1px;
-      height: 28px;
-      background: rgba(255,255,255,0.2);
-    }
-
     #header .title {
       font-size: 15px;
       font-weight: 600;
@@ -232,7 +198,6 @@
       border-radius: var(--radius-bubble);
       font-size: 15px;
       line-height: 1.6;
-      white-space: pre-wrap;
       word-break: break-word;
     }
 
@@ -249,6 +214,51 @@
       color: var(--clr-text);
       border-bottom-left-radius: 4px;
       box-shadow: var(--shadow);
+    }
+
+    /* HTML formatting emitted by the AI */
+    .msg.assistant .msg-bubble p      { margin-bottom: 0.7em; }
+    .msg.assistant .msg-bubble p:last-child { margin-bottom: 0; }
+    .msg.assistant .msg-bubble ul,
+    .msg.assistant .msg-bubble ol     { margin-bottom: 0.7em; padding-left: 1.5em; }
+    .msg.assistant .msg-bubble li     { margin-bottom: 0.2em; }
+    .msg.assistant .msg-bubble strong { font-weight: 700; }
+    .msg.assistant .msg-bubble em     { font-style: italic; }
+    .msg.assistant .msg-bubble code   {
+      background: var(--clr-surface);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: "Consolas", "Menlo", monospace;
+    }
+    .msg.assistant .msg-bubble pre    {
+      background: var(--clr-surface);
+      border: 1px solid var(--clr-border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      overflow-x: auto;
+      margin-bottom: 0.7em;
+    }
+    .msg.assistant .msg-bubble pre code {
+      background: none;
+      padding: 0;
+      font-size: 13px;
+    }
+    .msg.assistant .msg-bubble table  {
+      border-collapse: collapse;
+      width: 100%;
+      margin-bottom: 0.7em;
+      font-size: 14px;
+    }
+    .msg.assistant .msg-bubble th,
+    .msg.assistant .msg-bubble td     {
+      border: 1px solid var(--clr-border);
+      padding: 6px 10px;
+      text-align: left;
+    }
+    .msg.assistant .msg-bubble th     {
+      background: var(--clr-surface);
+      font-weight: 600;
     }
 
     /* Typing indicator */
@@ -381,11 +391,10 @@
 <!-- Password gate -->
 <div id="auth-overlay">
   <div id="auth-box">
-    <div class="logo-text">RoZwet</div>
     <h1>GraphRAG Intelligence</h1>
-    <p>Geef het toegangswachtwoord op om te beginnen</p>
-    <input type="password" id="password-input" placeholder="Wachtwoord" autocomplete="current-password" />
-    <button id="login-btn" onclick="doLogin()">Toegang</button>
+    <p>Enter the access password to continue</p>
+    <input type="password" id="password-input" placeholder="Password" autocomplete="current-password" />
+    <button id="login-btn" onclick="doLogin()">Sign in</button>
     <div id="auth-error"></div>
   </div>
 </div>
@@ -393,19 +402,14 @@
 <!-- App -->
 <div id="app">
   <div id="header">
-    <div class="brand">
-      <span class="brand-name">RoZwet</span>
-      <span class="brand-sub">GraphRAG</span>
-    </div>
-    <div class="divider"></div>
     <span class="title">GraphRAG — Stored Procedure Intelligence</span>
     <div id="status-dot" class="status-dot" title="Status"></div>
   </div>
 
   <div id="messages">
     <div class="welcome">
-      <h2>Welkom bij de GraphRAG Assistent</h2>
-      <p>Stel vragen over opgeslagen procedures, afhankelijkheden en tabelgebruik in de Sybase kennisbank. De assistent zoekt automatisch door de graph en geeft u een nauwkeurig antwoord.</p>
+      <h2>Welcome to the GraphRAG Assistant</h2>
+      <p>Ask questions about stored procedures, dependencies, and table usage. The assistant searches the graph automatically and provides accurate answers.</p>
     </div>
   </div>
 
@@ -415,11 +419,11 @@
     <textarea
       id="user-input"
       rows="1"
-      placeholder="Stel een vraag over stored procedures, tabellen of afhankelijkheden..."
+      placeholder="Ask a question about stored procedures, tables, or dependencies..."
       onkeydown="handleKey(event)"
       oninput="autoResize(this)"
     ></textarea>
-    <button id="send-btn" onclick="sendMessage()" title="Verstuur (Enter)">
+    <button id="send-btn" onclick="sendMessage()" title="Send (Enter)">
       <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
         <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
       </svg>
@@ -428,6 +432,11 @@
 </div>
 
 <script>
+  /* ------------------------------------------------------------------ */
+  /* Markdown renderer                                                    */
+  /* ------------------------------------------------------------------ */
+  marked.setOptions({ gfm: true, breaks: true });
+
   /* ------------------------------------------------------------------ */
   /* State                                                                */
   /* ------------------------------------------------------------------ */
@@ -445,7 +454,7 @@
 
     err.textContent = '';
     btn.disabled    = true;
-    btn.textContent = 'Bezig...';
+    btn.textContent = 'Signing in...';
 
     try {
       const res = await fetch('/api/auth', {
@@ -458,16 +467,16 @@
         document.getElementById('auth-overlay').style.display = 'none';
         document.getElementById('user-input').focus();
       } else {
-        err.textContent  = 'Onjuist wachtwoord. Probeer opnieuw.';
+        err.textContent  = 'Incorrect password. Please try again.';
         btn.disabled     = false;
-        btn.textContent  = 'Toegang';
+        btn.textContent  = 'Sign in';
         document.getElementById('password-input').value = '';
         document.getElementById('password-input').focus();
       }
     } catch {
-      err.textContent = 'Verbindingsfout. Controleer de server.';
+      err.textContent = 'Connection error. Please check the server.';
       btn.disabled    = false;
-      btn.textContent = 'Toegang';
+      btn.textContent = 'Sign in';
     }
   }
 
@@ -512,7 +521,7 @@
     const wrap = document.createElement('div');
     wrap.className = 'msg user';
     wrap.innerHTML = `
-      <div class="msg-label">U</div>
+      <div class="msg-label">You</div>
       <div class="msg-bubble">${escapeHtml(text)}</div>`;
     msgs.appendChild(wrap);
     scrollToBottom();
@@ -524,7 +533,7 @@
     wrap.className = 'msg assistant';
     wrap.id = 'typing-wrap';
     wrap.innerHTML = `
-      <div class="msg-label">Assistent</div>
+      <div class="msg-label">Assistant</div>
       <div class="typing-indicator"><span></span><span></span><span></span></div>`;
     msgs.appendChild(wrap);
     scrollToBottom();
@@ -545,13 +554,26 @@
     const notice = document.createElement('div');
     notice.className = 'msg assistant';
     notice.innerHTML = `<div class="tool-notice">Tool: ${escapeHtml(toolName)}</div>`;
-    msgs.appendChild(notice);
+    const typingWrap = document.getElementById('typing-wrap');
+    if (typingWrap) {
+      msgs.insertBefore(notice, typingWrap);
+    } else {
+      msgs.appendChild(notice);
+    }
     scrollToBottom();
   }
 
   function scrollToBottom() {
     const msgs = document.getElementById('messages');
     msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function scrollToBottomIfNear() {
+    const msgs = document.getElementById('messages');
+    const distanceFromBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight;
+    if (distanceFromBottom < 100) {
+      msgs.scrollTop = msgs.scrollHeight;
+    }
   }
 
   function escapeHtml(text) {
@@ -645,8 +667,8 @@
             case 'TEXT_MESSAGE_CONTENT':
               if (!bubble) bubble = replaceTypingWithBubble(typingWrap);
               assistantText += event.delta ?? '';
-              bubble.textContent = assistantText;
-              scrollToBottom();
+              bubble.innerHTML = marked.parse(assistantText);
+              scrollToBottomIfNear();
               break;
 
             case 'TOOL_CALL_START':
@@ -666,7 +688,7 @@
               break;
 
             case 'RUN_ERROR':
-              showError('Agent fout: ' + (event.message ?? 'Onbekende fout'));
+              showError('Agent error: ' + (event.message ?? 'Unknown error'));
               if (!bubble) replaceTypingWithBubble(typingWrap);
               break;
           }
@@ -678,9 +700,10 @@
 
     } catch (err) {
       typingWrap.remove();
-      showError('Verbindingsfout: ' + err.message);
+      showError('Connection error: ' + err.message);
       messages.pop(); // remove failed user message from history
     } finally {
+      typingWrap.removeAttribute('id');   // prevent stale id leaking into next turn
       isRunning = false;
       document.getElementById('send-btn').disabled = false;
       setStatus('active');

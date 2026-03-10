@@ -54,7 +54,7 @@
 
 ## Configuration
 
-`appsettings.json` is excluded from version control (it contains secrets). Copy the template below into a new `appsettings.json` in the project root and fill in your values:
+`appsettings.json` is excluded from version control (it contains secrets). Copy `appsettings.template.json` from the project root into a new `appsettings.json` and fill in your values:
 
 ```json
 {
@@ -84,6 +84,10 @@
     "CheckpointFile": "./checkpoint.json",
     "BatchSize": 50
   },
+  "Web": {
+    "Url": "http://localhost:5000",
+    "AccessPassword": "<your-access-password>"
+  },
   "Logging": {
     "LogLevel": {
       "Default": "Information",
@@ -110,6 +114,8 @@
 | `Ingestion:SqlSourceDirectory` | Directory containing your `.sp` files |
 | `Ingestion:CheckpointFile` | Path to the durable checkpoint file |
 | `Ingestion:BatchSize` | Procedures per Neo4j transaction batch (default: `50`) |
+| `Web:Url` | URL for the web server (default: `http://localhost:5000`) |
+| `Web:AccessPassword` | Password for the web chat UI |
 
 ---
 
@@ -125,7 +131,10 @@ dotnet restore
 
 ### 2. Configure
 
-Create `appsettings.json` in the project root using the template above.
+```bash
+cp appsettings.template.json appsettings.json
+# Edit appsettings.json and fill in your API keys and Neo4j credentials
+```
 
 ### 3. Place Your Stored Procedures
 
@@ -154,34 +163,21 @@ The pipeline will:
 
 Progress is logged to the console. Press **Ctrl+C** to safely interrupt — the next `--ingest` run will resume automatically from the last committed batch.
 
-### 5. Start Agentic Chat
+### 5. Start Web Chat
 
 ```bash
-dotnet run -- --chat
+dotnet run -- --web
 ```
 
-Type a question and press Enter. The model calls graph tools as needed before answering:
+Open `http://localhost:5000` in your browser. Enter the `Web:AccessPassword` to access the chat interface.
 
+### 6. Start MCP Server (optional)
+
+```bash
+dotnet run -- --mcp
 ```
-=== RoZwet GraphRAG Chat ===
-Type your question and press Enter. Type 'exit' to quit.
 
-You: Which procedures write to the Orders table?
-
-Agent: Let me search the graph for procedures that have a WRITE dependency on the Orders table.
-[tool: get_table_usage → Orders]
-The following procedures write to the **Orders** table:
-- `dbo.usp_InsertOrder` — inserts a new order row
-- `dbo.usp_UpdateOrderStatus` — updates the `Status` column
-- `dbo.usp_DeleteExpiredOrders` — deletes rows older than 90 days
-
-You: Show me the full SQL for usp_InsertOrder.
-[tool: get_procedure_sql → dbo.usp_InsertOrder]
-Agent: Here is the full body of `dbo.usp_InsertOrder`: ...
-
-You: exit
-Goodbye.
-```
+The MCP server listens on `Mcp:Url` (default: `http://localhost:3001`). Connect from any MCP-compatible client such as [Cline](https://github.com/cline/cline).
 
 ---
 
@@ -244,6 +240,12 @@ RETURN t.name;
 | `401 Unauthorized` on chat | Wrong Gemini API key | Replace `Ai:Chat:ApiKey` with a valid key from [Google AI Studio](https://aistudio.google.com/app/apikey) |
 | Pipeline restarts from scratch | Checkpoint file deleted or path changed | Ensure `Ingestion:CheckpointFile` points to the same path across runs |
 | Build error: duplicate `AssemblyInfo` | `probe/` project inside solution tree | The `probe/` directory is excluded in `.csproj` and `.gitignore` — do not remove those exclusions |
+
+---
+
+## License
+
+[MIT](LICENSE) — © 2026 RoZwet
 
 ---
 
