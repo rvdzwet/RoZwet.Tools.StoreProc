@@ -1,3 +1,5 @@
+using System.ClientModel;
+using System.Text.Json;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -68,7 +70,20 @@ internal sealed class ChatService
 
         for (int round = 0; round < _maxToolRounds; round++)
         {
-            var response = await _chatClient.GetResponseAsync(messages, chatOptions, cancellationToken);
+            ChatResponse response;
+            try
+            {
+                response = await _chatClient.GetResponseAsync(messages, chatOptions, cancellationToken);
+            }
+            catch (ClientResultException ex)
+            {
+                var rawBody = ex.GetRawResponse()?.Content?.ToString() ?? "(no body)";
+                _logger.LogError(
+                    "Chat API returned HTTP {Status} on round {Round}. Body: {Body}",
+                    ex.Status, round, rawBody);
+                throw;
+            }
+
             messages.AddRange(response.Messages);
 
             var toolCalls = response.Messages
@@ -87,9 +102,35 @@ internal sealed class ChatService
             var toolResultContents = new List<AIContent>(toolCalls.Count);
             foreach (var toolCall in toolCalls)
             {
+                _logger.LogInformation(
+                    "Tool call → '{ToolName}' | args: {Args}",
+                    toolCall.Name,
+                    JsonSerializer.Serialize(toolCall.Arguments));
+
                 var result = await InvokeToolSafeAsync(toolCall, cancellationToken);
-                toolResultContents.Add(new FunctionResultContent(toolCall.CallId, result));
+
+                // Gemini's OpenAI-compatible endpoint requires tool-result content to be a
+                // plain string.  Serialising a non-string object as the content body causes
+                // HTTP 400 on the tool-result round.
+                var resultString = result switch
+                {
+                    null        => string.Empty,
+                    string s    => s,
+                    _           => JsonSerializer.Serialize(result)
+                };
+
+                _logger.LogDebug(
+                    "Tool result for '{ToolName}' (callId={CallId}): {Result}",
+                    toolCall.Name,
+                    toolCall.CallId,
+                    resultString);
+
+                toolResultContents.Add(new FunctionResultContent(toolCall.CallId, resultString));
             }
+
+            _logger.LogDebug(
+                "Sending {Count} tool result(s) back to model on round {Round}.",
+                toolResultContents.Count, round + 1);
 
             messages.Add(new ChatMessage(ChatRole.Tool, toolResultContents));
         }

@@ -1,20 +1,41 @@
-# Active Context — v1.6.0
+# Active Context — v1.7.0
 
 ## Current State
-All planned features through v1.6.0 are implemented and building clean (0 errors, 0 warnings).
+All planned features through v1.7.0 are implemented and building clean (0 errors, 0 warnings).
 
 ## Completed Milestones
 
-### v1.4.0 — Streaming Reasoning Output
-- `ChatService.AskStreamingAsync` added; tool-call rounds use `GetResponseAsync`, final answer streams via `GetStreamingResponseAsync`
-- `TextReasoningContent` → `[Thinking]` (DarkGray), `TextContent` → `Assistant:` (default color)
-- `Microsoft.Extensions.AI` upgraded 9.5.0 → 10.3.0 for `TextReasoningContent`
-- `Program.cs` `RunChatAsync` uses streaming callback with per-chunk flush
+### v1.7.0 — MCP stdio Server
+- Added `ModelContextProtocol` 1.1.0 NuGet package to `RoZwet.Tools.StoreProc.csproj`.
+- New file: `src/Application/McpServer/StoreProcTools.cs`
+  - `[McpServerToolType]` class; DI-injected via `HybridSearchService` + `INeo4jRepository`.
+  - Four tools: `SearchProcedures`, `GetProcedureSql`, `ExpandCallChain`, `GetTableUsage`.
+  - All `[McpServerTool]` + `[Description]` attributes for schema discovery by MCP clients.
+- `Program.cs` updated:
+  - New `--mcp` mode added to valid args.
+  - `RunMcpAsync()` builds an independent `HostApplicationBuilder` with all logging routed to stderr.
+  - `WithStdioServerTransport()` + `WithToolsFromAssembly(typeof(StoreProcTools).Assembly)`.
+  - `PrintUsage()` updated to show the new `--mcp` flag.
+- Version bumped to 1.7.0.
 
-### v1.5.0 — Tier-1 Preprocessor + Background Retry Commit
-- `LegacySqlPreprocessor`: added `RAISERROR` all-variant pattern + Sybase multi-assign `SET→SELECT`
-- `PipelineOrchestrator`: retry pass now commits per-recovery to Neo4j (was missing)
-- `PipelineOrchestrator`: `IConfiguration` injected for `Ingestion:MaxConcurrency`
+### Cline Integration
+Add this to your Cline MCP settings:
+```json
+{
+  "mcpServers": {
+    "storedproc-graphrag": {
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "c:\\Users\\roman\\source\\repos\\RoZwet.Tools.StoreProc\\RoZwet.Tools.StoreProc.csproj",
+        "--",
+        "--mcp"
+      ]
+    }
+  }
+}
+```
 
 ### v1.6.0 — Fire-and-Forget Background AI Repair
 - `SqlAnalysisAgent` refactored into three focused methods:
@@ -28,21 +49,32 @@ All planned features through v1.6.0 are implemented and building clean (0 errors
   - `_totalProcessed` incremented via `Interlocked.Increment` in background tasks
   - `RetryPreviouslyFailedFilesAsync` uses both Tier-1 and awaited Tier-2 (sequential, already slow path)
 
+### v1.5.0 — Tier-1 Preprocessor + Background Retry Commit
+- `LegacySqlPreprocessor`: added `RAISERROR` all-variant pattern + Sybase multi-assign `SET→SELECT`
+- `PipelineOrchestrator`: retry pass now commits per-recovery to Neo4j (was missing)
+- `PipelineOrchestrator`: `IConfiguration` injected for `Ingestion:MaxConcurrency`
+
+### v1.4.0 — Streaming Reasoning Output
+- `ChatService.AskStreamingAsync` added; tool-call rounds use `GetResponseAsync`, final answer streams via `GetStreamingResponseAsync`
+- `TextReasoningContent` → `[Thinking]` (DarkGray), `TextContent` → `Assistant:` (default color)
+- `Microsoft.Extensions.AI` upgraded 9.5.0 → 10.3.0 for `TextReasoningContent`
+- `Program.cs` `RunChatAsync` uses streaming callback with per-chunk flush
+
 ## Active Configuration (appsettings.json)
 ```json
 "Ingestion": {
   "SqlSourceDirectory": "C:\\SP\\sp",
-  "CheckpointFile": "./checkpoint-1454.json",
-  "BatchSize": 1,
+  "CheckpointFile": "./checkpoint.json",
+  "BatchSize": 50,
   "MaxConcurrency": 4
 }
 ```
-Note: `MaxConcurrency` is no longer used by the main scan loop (replaced by fire-and-forget). It is still read for potential future use.
 
 ## Known Failures (FailedFiles in checkpoint)
 Background repair tasks are fire-and-forget — files failing AI repair remain in `FailedFiles` and will be retried on next run.
 
 ## Next Potential Actions
-- Monitor `[BG-REPAIR]` log entries during ingestion for repair success rate
-- Tune `BatchSize` for throughput vs. commit granularity
-- Consider bounded concurrency for background repair tasks if API rate limits are hit (add `SemaphoreSlim` around `RepairAndCompleteAsync` calls)
+- Hook `storedproc-graphrag` into Cline MCP settings and start building new services from the graph.
+- Monitor `[BG-REPAIR]` log entries during ingestion for repair success rate.
+- Tune `BatchSize` for throughput vs. commit granularity.
+- Consider bounded concurrency for background repair tasks if API rate limits are hit.

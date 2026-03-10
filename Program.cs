@@ -3,11 +3,14 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Server;
 using Neo4j.Driver;
+using Mscc.GenerativeAI.Microsoft;
 using OpenAI;
 using System.ClientModel;
 using RoZwet.Tools.StoreProc.Application.Agents;
 using RoZwet.Tools.StoreProc.Application.Contracts;
+using RoZwet.Tools.StoreProc.Application.McpServer;
 using RoZwet.Tools.StoreProc.Application.Pipeline;
 using RoZwet.Tools.StoreProc.Application.Services;
 using RoZwet.Tools.StoreProc.Infrastructure.Ai;
@@ -27,12 +30,15 @@ internal static class Program
         }
 
         var mode = args[0].ToLowerInvariant();
-        if (mode is not ("--ingest" or "--chat"))
+        if (mode is not ("--ingest" or "--chat" or "--mcp"))
         {
             Console.Error.WriteLine($"Unknown mode: '{args[0]}'");
             PrintUsage();
             return 1;
         }
+
+        if (mode == "--mcp")
+            return await RunMcpAsync();
 
         var host = BuildHost();
         await host.StartAsync();
@@ -52,6 +58,41 @@ internal static class Program
         }
     }
 
+    // -------------------------------------------------------------------------
+    // MCP stdio server — all application output MUST go to stderr.
+    // stdout is reserved exclusively for the JSON-RPC framing.
+    // -------------------------------------------------------------------------
+    private static async Task<int> RunMcpAsync()
+    {
+        var builder = Host.CreateApplicationBuilder();
+
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+            .AddEnvironmentVariables(prefix: "ROZWET_");
+
+        // Redirect every log line to stderr so stdout stays clean for MCP frames.
+        builder.Logging.ClearProviders();
+        builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
+        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+
+        var config = builder.Configuration;
+
+        RegisterNeo4j(builder.Services, config);
+        RegisterAiProviders(builder.Services, config);
+        RegisterApplicationServices(builder.Services, config);
+
+        builder.Services
+            .AddMcpServer()
+            .WithStdioServerTransport()
+            .WithToolsFromAssembly(typeof(StoreProcTools).Assembly);
+
+        await builder.Build().RunAsync();
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared host used by --ingest and --chat modes.
+    // -------------------------------------------------------------------------
     private static IHost BuildHost() =>
         Host.CreateDefaultBuilder()
             .ConfigureAppConfiguration(config =>
@@ -74,6 +115,9 @@ internal static class Program
             })
             .Build();
 
+    // -------------------------------------------------------------------------
+    // Service registrations — shared across all modes.
+    // -------------------------------------------------------------------------
     private static void RegisterNeo4j(IServiceCollection services, IConfiguration config)
     {
         services.AddSingleton<IDriver>(_ =>
@@ -90,7 +134,6 @@ internal static class Program
 
     private static void RegisterAiProviders(IServiceCollection services, IConfiguration config)
     {
-        // Embedding provider: Voyage AI (voyage-4-large)
         services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(_ =>
         {
             var endpoint       = RequireConfig(config, "Ai:Embedding:Endpoint");
@@ -104,18 +147,15 @@ internal static class Program
             return openAiClient.GetEmbeddingClient(embeddingModel).AsIEmbeddingGenerator();
         });
 
-        // Chat provider: Gemini 3 Flash (OpenAI-compatible endpoint)
+        // Chat provider: native Gemini SDK — preserves thought_signature for thinking models.
+        // The OpenAI-compatible endpoint strips thought_signature, causing HTTP 400 on tool-result
+        // rounds when using any Gemini thinking model (e.g. gemini-3-flash-preview).
         services.AddSingleton<IChatClient>(_ =>
         {
-            var endpoint  = RequireConfig(config, "Ai:Chat:Endpoint");
             var apiKey    = RequireConfig(config, "Ai:Chat:ApiKey");
             var chatModel = RequireConfig(config, "Ai:Chat:Model");
 
-            var openAiClient = new OpenAIClient(
-                new ApiKeyCredential(apiKey),
-                new OpenAIClientOptions { Endpoint = new Uri(endpoint) });
-
-            return openAiClient.GetChatClient(chatModel).AsIChatClient();
+            return new GeminiChatClient(apiKey: apiKey, model: chatModel);
         });
 
         services.AddSingleton(_ =>
@@ -147,6 +187,9 @@ internal static class Program
         services.AddSingleton<PipelineOrchestrator>();
     }
 
+    // -------------------------------------------------------------------------
+    // Mode runners.
+    // -------------------------------------------------------------------------
     private static async Task<int> RunIngestAsync(IServiceProvider services)
     {
         var logger       = services.GetRequiredService<ILogger<PipelineOrchestrator>>();
@@ -234,6 +277,9 @@ internal static class Program
         return 0;
     }
 
+    // -------------------------------------------------------------------------
+    // Utilities.
+    // -------------------------------------------------------------------------
     private static string RequireConfig(IConfiguration config, string key)
     {
         var value = config[key];
@@ -247,5 +293,6 @@ internal static class Program
         Console.WriteLine("Usage:");
         Console.WriteLine("  RoZwet.Tools.StoreProc --ingest   Run the ingestion pipeline");
         Console.WriteLine("  RoZwet.Tools.StoreProc --chat     Start the interactive chat session");
+        Console.WriteLine("  RoZwet.Tools.StoreProc --mcp      Start the MCP stdio server");
     }
 }

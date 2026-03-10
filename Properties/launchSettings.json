@@ -2,7 +2,7 @@
   "profiles": {
     "RoZwet.Tools.StoreProc": {
       "commandName": "Project",
-      "commandLineArgs": "--ingest"
+      "commandLineArgs": "--mcp"
     }
   }
 }

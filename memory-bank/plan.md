@@ -1,6 +1,6 @@
 # ARCHITECTURAL PLAN: RoZwet.Tools.StoreProc — GraphRAG Stored Procedure Intelligence System
 
-## Version: 1.6.0 | Status: ACTIVE
+## Version: 1.7.0 | Status: ACTIVE
 
 ---
 
@@ -179,7 +179,55 @@ OPTIONS { indexConfig: { `vector.dimensions`: 1024, `vector.similarity_function`
 
 ---
 
-## 8. HYBRID SEARCH CYPHER
+## 8. MCP SERVER (v1.7.0)
+
+### Transport
+stdio (JSON-RPC 2.0 over stdin/stdout) — the standard transport for Cline and Claude Desktop.
+All logging is routed to **stderr** only; stdout is reserved for MCP protocol frames.
+
+### Activation
+```
+RoZwet.Tools.StoreProc --mcp
+```
+
+### Registered Tools (`src/Application/McpServer/StoreProcTools.cs`)
+
+| MCP Tool Name | Input Parameters | Delegates To |
+|---|---|---|
+| `SearchProcedures` | `query: string` | `HybridSearchService.SearchAsync` |
+| `GetProcedureSql` | `name: string` | `INeo4jRepository.GetProcedureSqlAsync` |
+| `ExpandCallChain` | `name: string`, `depth: int (1–5)` | `INeo4jRepository.ExpandCallChainAsync` |
+| `GetTableUsage` | `tableName: string` | `INeo4jRepository.GetTableUsageAsync` |
+
+### Cline Integration (`cline_mcp_settings.json`)
+```json
+{
+  "mcpServers": {
+    "storedproc-graphrag": {
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "c:\\Users\\roman\\source\\repos\\RoZwet.Tools.StoreProc\\RoZwet.Tools.StoreProc.csproj",
+        "--",
+        "--mcp"
+      ]
+    }
+  }
+}
+```
+
+### Design Notes
+- `[McpServerToolType]` / `[McpServerTool]` attributes drive discovery via `WithToolsFromAssembly`.
+- `StoreProcTools` is an `internal sealed` DI-injected class — constructor receives `HybridSearchService` + `INeo4jRepository`.
+- The `--mcp` host is built with `Host.CreateApplicationBuilder()` independently of the existing `BuildHost()` to guarantee stderr-only logging.
+- `IChatClient` and `ChatService` are registered but never resolved in MCP mode — factories are lazy, no Gemini calls occur.
+- No authentication — stdio transport is local-process-only by design.
+
+---
+
+## 9. HYBRID SEARCH CYPHER
+
 
 ```cypher
 -- Step A: Vector similarity search
