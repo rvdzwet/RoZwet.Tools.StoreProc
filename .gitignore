@@ -1,0 +1,19 @@
+## Build output
+bin/
+obj/
+
+## Secrets — never commit
+appsettings.json
+
+## Runtime state — never commit
+checkpoint.json
+checkpoint.json.tmp
+
+## VS artifacts
+.vs/
+*.user
+*.suo
+
+## OS
+.DS_Store
+Thumbs.db
