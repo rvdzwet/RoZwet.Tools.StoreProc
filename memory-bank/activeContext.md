@@ -1,11 +1,11 @@
 # ACTIVE CONTEXT: RoZwet.Tools.StoreProc
 
 ## Current Operation
-**MIGRATION v1.1.0 — COMPLETE: Gemini 3 Flash + Voyage AI + Agentic Tool Loop**
+**v1.2.0 — Two-Tier SQL Parse Resilience (AI-Assisted Repair)**
 
 ## State
 - Phase: Production Ready
-- Migration Completed: 2026-03-10
+- Last Updated: 2026-03-10
 - Status: BUILD SUCCEEDED — Zero errors, zero warnings
 
 ## Completed Steps — v1.1.0 Migration
@@ -18,6 +18,12 @@
 - [x] GraphQueryTools.cs (NEW) — 4 AIFunction tool definitions wrapping Neo4j graph
 - [x] ChatService — full agentic tool-calling loop (MaxToolRounds=5, AIFunctionArguments, correct API surface)
 - [x] RoZwet.Tools.StoreProc.csproj — probe/ directory excluded from main compilation glob
+
+## Completed Steps — v1.2.0 SQL Parse Resilience
+- [x] `LegacySqlPreprocessor` — added 5 new Sybase patterns: `*=` (left outer join), `=*` (right outer join), `FOR READ ONLY` / `FOR BROWSE` cursor options, `SET SHOWPLAN ON|OFF`, `SET PROCID ON|OFF`
+- [x] `AiSqlRepairAgent` (NEW) — AI-powered fallback: sends failed SQL + parse errors to Gemini, strips markdown fences, retries parsing on repaired output; original SQL always preserved for graph storage
+- [x] `SqlAnalysisAgent` — injected `AiSqlRepairAgent`; `ParseProcedure` made async; two-tier logic: Tier-1 preprocessor → Tier-2 AI repair on parse failure; warnings only emitted when AI also fails
+- [x] `Program.cs` — registered `AiSqlRepairAgent` as singleton; added `using RoZwet.Tools.StoreProc.Infrastructure.Parsing`
 
 ## AI Provider Configuration (v1.1.0)
 | Role | Provider | Model | Endpoint |
@@ -66,7 +72,7 @@
 | Risk | Status |
 |---|---|
 | voyage-4-large dimension mismatch | MITIGATED — dims read from config, propagated to index + EmbeddingGenerator |
-| Sybase-specific SQL syntax failures | MITIGATED — per-file try/catch with warning log |
+| Sybase-specific SQL syntax failures | MITIGATED — Tier-1 regex preprocessor + Tier-2 AI repair; warning only on full failure |
 | Neo4j vector index not available | MITIGATED — idempotent init with clear error logging |
 | Interruption during 5,500-file run | MITIGATED — checkpoint.json ensures resume from last committed batch |
 | Agentic loop runaway | MITIGATED — MaxToolRounds=5 cap, tool exceptions caught and returned as error content |

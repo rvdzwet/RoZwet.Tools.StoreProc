@@ -61,17 +61,17 @@
   "Neo4j": {
     "Uri": "bolt://localhost:7687",
     "Username": "neo4j",
-    "Password": "YOUR_NEO4J_PASSWORD"
+    "Password": "<your-neo4j-password>"
   },
   "Ai": {
     "Chat": {
       "Endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/",
-      "ApiKey": "YOUR_GEMINI_API_KEY",
+      "ApiKey": "<your-gemini-api-key>",
       "Model": "gemini-3-flash-preview"
     },
     "Embedding": {
       "Endpoint": "https://api.voyageai.com/v1",
-      "ApiKey": "YOUR_VOYAGE_API_KEY",
+      "ApiKey": "<your-voyage-api-key>",
       "Model": "voyage-4-large",
       "Dimensions": 1024
     },

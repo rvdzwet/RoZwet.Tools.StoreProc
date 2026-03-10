@@ -37,28 +37,28 @@ internal sealed class IngestionCheckpoint
     /// </summary>
     public async Task LoadAsync(CancellationToken cancellationToken = default)
     {
-        if (!File.Exists(_checkpointFilePath))
-        {
-            _logger.LogInformation("No checkpoint found at '{Path}'. Starting from index 0.", _checkpointFilePath);
-            _state = new CheckpointState();
-            return;
-        }
+        //if (!File.Exists(_checkpointFilePath))
+        //{
+        //    _logger.LogInformation("No checkpoint found at '{Path}'. Starting from index 0.", _checkpointFilePath);
+        //    _state = new CheckpointState();
+        //    return;
+        //}
 
-        try
-        {
-            var json = await File.ReadAllTextAsync(_checkpointFilePath, cancellationToken);
-            _state = JsonSerializer.Deserialize<CheckpointState>(json, SerializerOptions)
-                     ?? new CheckpointState();
+        //try
+        //{
+        //    var json = await File.ReadAllTextAsync(_checkpointFilePath, cancellationToken);
+        //    _state = JsonSerializer.Deserialize<CheckpointState>(json, SerializerOptions)
+        //             ?? new CheckpointState();
 
-            _logger.LogInformation(
-                "Checkpoint loaded. Resuming from index {Index} (total processed: {Total}).",
-                _state.LastCommittedIndex + 1, _state.TotalProcessed);
-        }
-        catch (JsonException ex)
-        {
-            _logger.LogError(ex, "Checkpoint file corrupted at '{Path}'. Starting from index 0.", _checkpointFilePath);
-            _state = new CheckpointState();
-        }
+        //    _logger.LogInformation(
+        //        "Checkpoint loaded. Resuming from index {Index} (total processed: {Total}).",
+        //        _state.LastCommittedIndex + 1, _state.TotalProcessed);
+        //}
+        //catch (JsonException ex)
+        //{
+        //    _logger.LogError(ex, "Checkpoint file corrupted at '{Path}'. Starting from index 0.", _checkpointFilePath);
+        //    _state = new CheckpointState();
+        //}
     }
 
     /// <summary>

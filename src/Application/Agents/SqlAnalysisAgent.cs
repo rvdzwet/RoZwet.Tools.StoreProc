@@ -9,24 +9,43 @@ namespace RoZwet.Tools.StoreProc.Application.Agents;
 /// <summary>
 /// Agent responsible for the full analysis pipeline of a single SQL file:
 /// parse the AST, extract dependencies, and generate a semantic embedding.
+///
+/// Parse resilience follows a two-tier strategy:
+/// <list type="number">
+///   <item>
+///     Tier 1 — <see cref="LegacySqlPreprocessor"/> applies deterministic regex
+///     transforms for known Sybase patterns before handing SQL to
+///     <c>TSql160Parser</c>.
+///   </item>
+///   <item>
+///     Tier 2 — If parsing still fails, <see cref="AiSqlRepairAgent"/> sends the
+///     SQL and error messages to the configured LLM and retries parsing on the
+///     AI-repaired version.  The original SQL is always preserved for graph storage.
+///   </item>
+/// </list>
+///
 /// Stateless — all produced state is returned as a <see cref="StoredProcedure"/> aggregate.
 /// </summary>
 internal sealed class SqlAnalysisAgent
 {
     private readonly EmbeddingProvider _embeddingProvider;
+    private readonly AiSqlRepairAgent _repairAgent;
     private readonly ILogger<SqlAnalysisAgent> _logger;
 
     public SqlAnalysisAgent(
         EmbeddingProvider embeddingProvider,
+        AiSqlRepairAgent repairAgent,
         ILogger<SqlAnalysisAgent> logger)
     {
         _embeddingProvider = embeddingProvider;
+        _repairAgent = repairAgent;
         _logger = logger;
     }
 
     /// <summary>
     /// Analyzes a stored procedure SQL file and returns a fully enriched domain aggregate.
-    /// Returns <see langword="null"/> if the file cannot be parsed as a valid stored procedure.
+    /// Returns <see langword="null"/> if the file cannot be parsed as a valid stored procedure
+    /// even after AI-assisted repair.
     /// </summary>
     public async Task<StoredProcedure?> AnalyzeAsync(
         string sqlFilePath,
@@ -40,7 +59,7 @@ internal sealed class SqlAnalysisAgent
             return null;
         }
 
-        var procedure = ParseProcedure(sql, sqlFilePath);
+        var procedure = await ParseProcedureAsync(sql, sqlFilePath, cancellationToken);
         if (procedure is null)
             return null;
 
@@ -54,18 +73,51 @@ internal sealed class SqlAnalysisAgent
         return procedure;
     }
 
-    private StoredProcedure? ParseProcedure(string sql, string filePath)
+    private async Task<StoredProcedure?> ParseProcedureAsync(
+        string sql,
+        string filePath,
+        CancellationToken cancellationToken)
     {
         var parser = new TSql160Parser(initialQuotedIdentifiers: true);
+        var normalizedSql = LegacySqlPreprocessor.Normalize(sql);
 
-        using var reader = new StringReader(sql);
+        using var reader = new StringReader(normalizedSql);
         var fragment = parser.Parse(reader, out var errors);
 
         if (errors.Count > 0)
         {
-            _logger.LogWarning(
-                "Parse errors in '{FilePath}': {ErrorCount} error(s). First: {FirstError}",
-                filePath, errors.Count, errors[0].Message);
+            _logger.LogDebug(
+                "Tier-1 parse errors in '{FilePath}': {Count} error(s). Invoking AI repair.",
+                filePath, errors.Count);
+
+            var repairedSql = await _repairAgent.RepairAsync(normalizedSql, errors, cancellationToken);
+
+            if (repairedSql is not null)
+            {
+                using var repairedReader = new StringReader(repairedSql);
+                var repairedFragment = parser.Parse(repairedReader, out var repairedErrors);
+
+                if (repairedErrors.Count == 0)
+                {
+                    _logger.LogInformation(
+                        "AI repair succeeded for '{FilePath}'. Proceeding with repaired AST.",
+                        filePath);
+                    fragment = repairedFragment;
+                    errors = repairedErrors;
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "AI repair did not resolve all errors in '{FilePath}': {Count} error(s) remain. First: {First}",
+                        filePath, repairedErrors.Count, repairedErrors[0].Message);
+                }
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Parse errors in '{FilePath}': {ErrorCount} error(s). First: {FirstError}",
+                    filePath, errors.Count, errors[0].Message);
+            }
         }
 
         var createProc = FindCreateProcedureStatement(fragment);
@@ -95,15 +147,15 @@ internal sealed class SqlAnalysisAgent
 
     private static CreateProcedureStatement? FindCreateProcedureStatement(TSqlFragment fragment)
     {
-        if (fragment is TSqlScript script)
+        if (fragment is not TSqlScript script)
+            return null;
+
+        foreach (var batch in script.Batches)
         {
-            foreach (var batch in script.Batches)
+            foreach (var statement in batch.Statements)
             {
-                foreach (var statement in batch.Statements)
-                {
-                    if (statement is CreateProcedureStatement createProc)
-                        return createProc;
-                }
+                if (statement is CreateProcedureStatement createProc)
+                    return createProc;
             }
         }
 

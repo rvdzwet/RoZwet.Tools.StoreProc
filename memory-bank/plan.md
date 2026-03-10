@@ -1,6 +1,6 @@
 # ARCHITECTURAL PLAN: RoZwet.Tools.StoreProc — GraphRAG Stored Procedure Intelligence System
 
-## Version: 1.1.0 | Status: ACTIVE
+## Version: 1.2.0 | Status: ACTIVE
 
 ---
 
@@ -41,7 +41,9 @@ Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling se
 ├─────────────────────────────────────────────────────────────────┤
 │  INFRASTRUCTURE LAYER (src/Infrastructure/)                      │
 │    ├── Parsing/                                                  │
-│    │   └── TsqlFragmentVisitor.cs — ScriptDom AST walker         │
+│    │   ├── TsqlFragmentVisitor.cs — ScriptDom AST walker         │
+│    │   ├── LegacySqlPreprocessor.cs — Sybase regex normaliser    │
+│    │   └── AiSqlRepairAgent.cs — AI fallback for parse failures  │
 │    ├── Neo4j/                                                    │
 │    │   ├── Neo4jRepository.cs   — Implements 7 port methods      │
 │    │   └── Neo4jIndexInitializer.cs — Config-driven vector index │
@@ -74,7 +76,19 @@ No additional NuGet packages are required — `Microsoft.Extensions.AI.OpenAI` h
 - IEmbeddingGenerator: Voyage AI voyage-4-large via OpenAI-compatible adapter
 - IChatClient: Gemini 3 Flash via Google's OpenAI-compatible endpoint
 
-### Phase 2 — SQL Analysis Agent
+### Phase 2 — SQL Analysis Agent (v1.2.0 — Two-Tier Parse Resilience)
+- **Tier 1 — `LegacySqlPreprocessor`** (deterministic, zero API cost):
+  - RAISERROR legacy format → `RAISERROR(msg, 16, 1)`
+  - `SET ARITHABORT NUMERIC_TRUNCATION` → stripped
+  - Double-quoted strings → single-quoted
+  - `*=` / `=*` (Sybase outer joins) → `=`
+  - `FOR READ ONLY` / `FOR BROWSE` cursor options → stripped
+  - `SET SHOWPLAN ON|OFF` / `SET PROCID ON|OFF` → stripped
+- **Tier 2 — `AiSqlRepairAgent`** (AI fallback, only fires on Tier-1 failure):
+  - Sends preprocessed SQL + TSql160Parser errors to Gemini
+  - Retries parsing on AI-repaired SQL
+  - Original SQL always preserved verbatim for graph storage
+  - Warning log only emitted when both tiers fail
 - TSqlFragmentVisitor walks AST for EXEC calls and FROM/JOIN table refs
 - Produces: List<ProcedureCall>, List<TableDependency>
 - Generates: float[] embedding via IEmbeddingGenerator

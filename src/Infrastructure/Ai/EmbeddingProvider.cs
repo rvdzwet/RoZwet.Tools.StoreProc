@@ -30,12 +30,20 @@ internal sealed class EmbeddingProvider
 
         _logger.LogDebug("Generating embedding for text of length {Length}.", text.Length);
 
-        var results = await _generator.GenerateAsync([text], cancellationToken: cancellationToken);
-
-        var vector = results[0].Vector.ToArray();
-
-        _logger.LogDebug("Embedding generated: {Dims} dimensions.", vector.Length);
-
-        return vector;
+        try
+        {
+            var results = await _generator.GenerateAsync([text], cancellationToken: cancellationToken);
+            var vector = results[0].Vector.ToArray();
+            _logger.LogDebug("Embedding generated: {Dims} dimensions.", vector.Length);
+            return vector;
+        }
+        catch (System.ClientModel.ClientResultException ex)
+        {
+            var rawBody = ex.GetRawResponse()?.Content.ToString() ?? ex.Message;
+            _logger.LogError(
+                "Embedding API rejected request. Status: {Status} | InputLength: {Length} chars | RawResponse: {Raw}",
+                ex.Status, text.Length, rawBody);
+            throw;
+        }
     }
 }
