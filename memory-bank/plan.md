@@ -1,6 +1,6 @@
 # ARCHITECTURAL PLAN: RoZwet.Tools.StoreProc — GraphRAG Stored Procedure Intelligence System
 
-## Version: 1.7.0 | Status: ACTIVE
+## Version: 1.8.0 | Status: ACTIVE
 
 ---
 
@@ -131,6 +131,7 @@ No additional NuGet packages are required — `Microsoft.Extensions.AI.OpenAI` h
 | `$$"""..."""` raw strings for Cypher with dynamic values | Single `{`/`}` are literal Cypher braces; `{{expr}}` safely interpolates validated ints |
 | Voyage AI over Codestral-Embed | voyage-4-large: superior code+schema semantic understanding |
 | Gemini 3 Flash over Codestral | State-of-the-art reasoning; tool-calling native support; OpenAI-compatible |
+| Query-translation before embedding (v1.8.0) | Neo4j embeddings are Dutch; translating any query to Dutch via LLM before `EmbeddingProvider.GenerateAsync` yields correct cosine similarity without re-indexing. Fallback to original query on translation failure. LLM replies in user's original language via system-prompt rule. |
 
 ---
 

@@ -1,9 +1,23 @@
-# Active Context — v1.7.0
+# Active Context — v1.8.0
 
 ## Current State
-All planned features through v1.7.0 are implemented and building clean (0 errors, 0 warnings).
+All planned features through v1.8.0 are implemented and building clean (0 errors, 0 warnings).
 
 ## Completed Milestones
+
+### v1.8.0 — Multilingual Query Support
+- **Problem:** Neo4j vector embeddings are generated from Dutch text. Non-Dutch queries produce
+  embedding vectors that are semantically misaligned with the stored Dutch vectors, causing poor
+  search recall.
+- **Solution:** Query-translation layer injected into `HybridSearchService` — zero re-indexing required.
+- Changes:
+  - `HybridSearchService`: injected `IChatClient`; added `TranslateToDataLanguageAsync` which calls
+    the LLM with a strict single-sentence system prompt to translate the query to Dutch before
+    `EmbeddingProvider.GenerateAsync`. Falls back to the original query if translation fails.
+  - `ChatService.SystemPrompt`: added final rule instructing the LLM to always reply in the
+    user's original language while keeping procedure/table identifiers unchanged.
+- Both the interactive `chat` path and the MCP `SearchProcedures` tool path benefit automatically.
+
 
 ### v1.7.0 — MCP HTTP Server
 - Replaced `ModelContextProtocol` with `ModelContextProtocol.AspNetCore` 1.1.0.
