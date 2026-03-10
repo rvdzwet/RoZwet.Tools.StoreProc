@@ -1,12 +1,12 @@
 # ARCHITECTURAL PLAN: RoZwet.Tools.StoreProc — GraphRAG Stored Procedure Intelligence System
 
-## Version: 1.0.0 | Status: ACTIVE
+## Version: 1.1.0 | Status: ACTIVE
 
 ---
 
 ## 1. MISSION STATEMENT
 
-Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling semantic hybrid search and real-time chat-driven intelligence over the procedural dependency graph.
+Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling semantic hybrid search and real-time agentic chat-driven intelligence over the procedural dependency graph.
 
 ---
 
@@ -19,7 +19,7 @@ Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling se
 ├─────────────────────────────────────────────────────────────────┤
 │  ENTRY POINT: Program.cs (DI Bootstrap + Mode Selector)          │
 │    ├── Mode: --ingest  → PipelineOrchestrator                    │
-│    └── Mode: --chat    → ChatLoop                                │
+│    └── Mode: --chat    → Agentic ChatLoop                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  DOMAIN LAYER (src/Domain/)                                      │
 │    ├── StoredProcedure.cs       — Aggregate root                 │
@@ -28,20 +28,23 @@ Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling se
 ├─────────────────────────────────────────────────────────────────┤
 │  APPLICATION LAYER (src/Application/)                            │
 │    ├── Agents/                                                   │
-│    │   └── SqlAnalysisAgent.cs  — MAF Agent: parse + embed       │
+│    │   ├── SqlAnalysisAgent.cs  — MAF Agent: parse + embed       │
+│    │   └── GraphQueryTools.cs   — 4 AIFunction tool definitions  │
+│    ├── Contracts/                                                │
+│    │   └── INeo4jRepository.cs  — Port: 7 methods                │
 │    ├── Pipeline/                                                 │
 │    │   ├── PipelineOrchestrator.cs — Durable run coordinator     │
 │    │   └── IngestionCheckpoint.cs  — Resume-state tracker        │
 │    └── Services/                                                 │
 │        ├── HybridSearchService.cs — Vector + Graph traversal     │
-│        └── ChatService.cs         — RAG chat orchestration       │
+│        └── ChatService.cs         — Agentic tool-calling loop    │
 ├─────────────────────────────────────────────────────────────────┤
 │  INFRASTRUCTURE LAYER (src/Infrastructure/)                      │
 │    ├── Parsing/                                                  │
 │    │   └── TsqlFragmentVisitor.cs — ScriptDom AST walker         │
 │    ├── Neo4j/                                                    │
-│    │   ├── Neo4jRepository.cs   — Upsert nodes/edges, batch=50   │
-│    │   └── Neo4jIndexInitializer.cs — Vector index bootstrap     │
+│    │   ├── Neo4jRepository.cs   — Implements 7 port methods      │
+│    │   └── Neo4jIndexInitializer.cs — Config-driven vector index │
 │    └── Ai/                                                       │
 │        ├── EmbeddingProvider.cs  — IEmbeddingGenerator wrapper   │
 │        └── ChatProvider.cs       — IChatClient wrapper           │
@@ -50,14 +53,26 @@ Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling se
 
 ---
 
-## 3. PHASE BREAKDOWN
+## 3. AI PROVIDER CONFIGURATION (v1.1.0)
+
+| Role | Provider | Model | Endpoint |
+|---|---|---|---|
+| **Chat / Agent** | Google Gemini | `gemini-3-flash-preview` | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| **Embeddings** | Voyage AI | `voyage-4-large` | `https://api.voyageai.com/v1` |
+
+Both providers are accessed via the OpenAI-compatible REST protocol.
+No additional NuGet packages are required — `Microsoft.Extensions.AI.OpenAI` handles both.
+
+---
+
+## 4. PHASE BREAKDOWN
 
 ### Phase 1 — Infrastructure Setup
 - Target framework: net10.0
 - DI container: Microsoft.Extensions.Hosting
-- Neo4j vector index: Cosine similarity, 1024 dimensions, on Procedure nodes
-- IEmbeddingGenerator: Codestral-Embed via MAIA OpenAI-compatible endpoint
-- IChatClient: Codestral-Instruct via MAIA OpenAI-compatible endpoint
+- Neo4j vector index: Cosine similarity, `Ai:Embedding:Dimensions` (default 1024), on Procedure nodes
+- IEmbeddingGenerator: Voyage AI voyage-4-large via OpenAI-compatible adapter
+- IChatClient: Gemini 3 Flash via Google's OpenAI-compatible endpoint
 
 ### Phase 2 — SQL Analysis Agent
 - TSqlFragmentVisitor walks AST for EXEC calls and FROM/JOIN table refs
@@ -76,29 +91,39 @@ Process 5,500 Sybase stored procedures into a Neo4j GraphRAG system, enabling se
 - PipelineOrchestrator: discover → load checkpoint → process → upsert → save checkpoint
 - Safe to CTRL+C and restart — zero re-processing of committed batches
 
-### Phase 5 — Hybrid Search + Chat
-- Vector search: top 3 nearest procedure embeddings
-- Graph expansion: 1-hop CALLS/READS_FROM neighbors
-- Chat: inject structured context into system prompt → IChatClient
+### Phase 5 — Agentic GraphRAG Chat (v1.1.0)
+- `GraphQueryTools` exposes 4 `AIFunction` definitions:
+  - `search_procedures(query)` → hybrid vector+graph search
+  - `get_procedure_sql(name)` → full SQL body lookup
+  - `expand_call_chain(name, depth)` → transitive CALLS traversal (depth 1–5)
+  - `get_table_usage(tableName)` → all procedures touching a table
+- `ChatService` runs an agentic tool-calling loop:
+  - System prompt instructs strategy: search → inspect → expand → answer
+  - Loop: `GetResponseAsync` → check tool calls → `AIFunctionArguments(dict)` → `InvokeAsync` → append results
+  - Capped at `Ai:Agent:MaxToolRounds` (default 5)
+  - After cap exhaustion: final pass with empty `ChatOptions` to force text answer
 
 ---
 
-## 4. KEY DESIGN DECISIONS
+## 5. KEY DESIGN DECISIONS
 
 | Decision | Rationale |
 |---|---|
 | Checkpoint as atomic JSON file | Zero external dependency; temp-file swap guarantees no corrupt state |
 | Batch size = 50 | Balances Bolt transaction overhead vs memory for 5,500 procedures |
 | Vector index on Procedure nodes only | Tables are structural; only procedure semantics need embedding |
-| 1-hop graph expansion | Sufficient context without exponential traversal cost |
-| TSqlFragmentVisitor for Sybase SQL | ScriptDom T-SQL dialect covers EXEC/FROM patterns common to Sybase ASE |
+| Agentic loop with MaxToolRounds cap | Prevents runaway multi-hop reasoning; 5 rounds sufficient for complex dependency chains |
+| AIFunction lambdas vs method groups | Explicit lambda captures prevent delegate type ambiguity |
+| `$$"""..."""` raw strings for Cypher with dynamic values | Single `{`/`}` are literal Cypher braces; `{{expr}}` safely interpolates validated ints |
+| Voyage AI over Codestral-Embed | voyage-4-large: superior code+schema semantic understanding |
+| Gemini 3 Flash over Codestral | State-of-the-art reasoning; tool-calling native support; OpenAI-compatible |
 
 ---
 
-## 5. NEO4J GRAPH SCHEMA
+## 6. NEO4J GRAPH SCHEMA
 
 ### Nodes
-- `(:Procedure {name, schema, sql, embedding: float[1024]})`
+- `(:Procedure {name, schema, sql, embedding: float[N]})`  — N from `Ai:Embedding:Dimensions`
 - `(:Table {name, schema})`
 
 ### Relationships
@@ -115,41 +140,49 @@ OPTIONS { indexConfig: { `vector.dimensions`: 1024, `vector.similarity_function`
 
 ---
 
-## 6. CONFIGURATION SCHEMA (appsettings.json)
+## 7. CONFIGURATION SCHEMA (appsettings.json — v1.1.0)
 
 ```json
 {
-  "Neo4j": {
-    "Uri": "bolt://localhost:7687",
-    "Username": "neo4j",
-    "Password": "<secret>"
-  },
+  "Neo4j": { "Uri": "bolt://localhost:7687", "Username": "neo4j", "Password": "<secret>" },
   "Ai": {
-    "Endpoint": "https://codestral.mistral.ai/v1",
-    "ApiKey": "<secret>",
-    "EmbeddingModel": "codestral-embed",
-    "ChatModel": "codestral-latest"
+    "Chat": {
+      "Endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "ApiKey": "<gemini-api-key>",
+      "Model": "gemini-3-flash-preview"
+    },
+    "Embedding": {
+      "Endpoint": "https://api.voyageai.com/v1",
+      "ApiKey": "<voyage-api-key>",
+      "Model": "voyage-4-large",
+      "Dimensions": 1024
+    },
+    "Agent": { "MaxToolRounds": 5 }
   },
-  "Ingestion": {
-    "SqlSourceDirectory": "./sql",
-    "CheckpointFile": "./checkpoint.json",
-    "BatchSize": 50
-  }
+  "Ingestion": { "SqlSourceDirectory": "./sql", "CheckpointFile": "./checkpoint.json", "BatchSize": 50 }
 }
 ```
 
 ---
 
-## 7. HYBRID SEARCH CYPHER
+## 8. HYBRID SEARCH CYPHER
 
 ```cypher
-// Step A: Vector similarity search
+-- Step A: Vector similarity search
 CALL db.index.vector.queryNodes('procedure_embeddings', 3, $embedding)
 YIELD node AS p, score
 RETURN p.name, p.sql, score
 
-// Step B: 1-hop graph expansion
+-- Step B: 1-hop graph expansion
 MATCH (p:Procedure)-[:CALLS|READS_FROM]->(related)
 WHERE p.name IN $topNames
-RETURN p.name, collect(DISTINCT related.name) AS related
+RETURN DISTINCT related.name AS relatedName
+
+-- Step C (agentic): N-hop call chain
+MATCH (root:Procedure {name: $name})-[:CALLS*1..3]->(callee:Procedure)
+RETURN DISTINCT callee.name AS calleeName ORDER BY calleeName
+
+-- Step D (agentic): Table usage
+MATCH (p:Procedure)-[:READS_FROM|WRITES_TO]->(t:Table {name: $tableName})
+RETURN DISTINCT p.name AS procName ORDER BY procName
 ```

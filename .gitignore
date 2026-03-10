@@ -14,6 +14,9 @@ checkpoint.json.tmp
 *.user
 *.suo
 
+## Temporary reflection probe (not part of production code)
+probe/
+
 ## OS
 .DS_Store
 Thumbs.db

@@ -1,56 +1,129 @@
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using RoZwet.Tools.StoreProc.Infrastructure.Ai;
+using RoZwet.Tools.StoreProc.Application.Agents;
 
 namespace RoZwet.Tools.StoreProc.Application.Services;
 
 /// <summary>
-/// Grounds a user question in the retrieved graph context and generates a response
-/// via the configured <see cref="ChatProvider"/>.
+/// Agentic chat service: runs a tool-calling loop that lets the language model
+/// query the Neo4j graph knowledge base before composing its final answer.
+/// The loop is capped at <c>Ai:Agent:MaxToolRounds</c> to prevent runaway execution.
 /// </summary>
 internal sealed class ChatService
 {
-    private const string SystemPromptTemplate = """
+    private const string SystemPrompt = """
         You are an expert database engineer specializing in Sybase stored procedure analysis.
-        Answer the user's question using ONLY the stored procedure code and relationships provided below.
-        If the answer cannot be determined from the provided context, state that clearly.
-        Do not invent procedure names, table names, or logic that is not present in the context.
+        You have access to tools that query a Neo4j graph database containing thousands of
+        stored procedures with semantic embeddings and dependency relationships.
 
-        {CONTEXT}
+        Strategy:
+        1. Use search_procedures to locate semantically relevant procedures.
+        2. Use get_procedure_sql to inspect full SQL bodies when needed.
+        3. Use expand_call_chain to understand transitive dependencies.
+        4. Use get_table_usage to find all procedures touching a specific table.
+
+        Rules:
+        - Only cite procedures and tables that you retrieved through the tools.
+        - Do not invent procedure names, table names, or SQL logic.
+        - When context is insufficient, state that clearly rather than guessing.
+        - Provide precise, technical answers suitable for a senior database engineer.
         """;
 
-    private readonly HybridSearchService _searchService;
-    private readonly ChatProvider _chatProvider;
+    private readonly IChatClient _chatClient;
+    private readonly GraphQueryTools _tools;
+    private readonly int _maxToolRounds;
     private readonly ILogger<ChatService> _logger;
 
     public ChatService(
-        HybridSearchService searchService,
-        ChatProvider chatProvider,
+        IChatClient chatClient,
+        GraphQueryTools tools,
+        IConfiguration config,
         ILogger<ChatService> logger)
     {
-        _searchService = searchService;
-        _chatProvider = chatProvider;
+        _chatClient = chatClient;
+        _tools = tools;
+        _maxToolRounds = int.TryParse(config["Ai:Agent:MaxToolRounds"], out var r) && r > 0 ? r : 5;
         _logger = logger;
     }
 
     /// <summary>
-    /// Answers a user question using the GraphRAG pipeline:
-    /// search → context injection → chat completion.
+    /// Answers a user question using the agentic GraphRAG pipeline.
+    /// The model may call tools multiple times before returning a final answer.
     /// </summary>
     public async Task<string> AskAsync(string question, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(question))
             throw new ArgumentException("Question cannot be empty.", nameof(question));
 
-        _logger.LogInformation("Processing question: {Question}", question);
+        _logger.LogInformation("Agentic chat started. MaxToolRounds={Max}.", _maxToolRounds);
 
-        var context = await _searchService.SearchAsync(question, cancellationToken);
+        var chatOptions = new ChatOptions { Tools = [.. _tools.All] };
 
-        var systemPrompt = SystemPromptTemplate.Replace("{CONTEXT}", context.ToContextString());
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.System, SystemPrompt),
+            new(ChatRole.User, question)
+        };
 
-        var answer = await _chatProvider.CompleteAsync(systemPrompt, question, cancellationToken);
+        for (int round = 0; round < _maxToolRounds; round++)
+        {
+            var response = await _chatClient.GetResponseAsync(messages, chatOptions, cancellationToken);
+            messages.AddRange(response.Messages);
 
-        _logger.LogInformation("Answer generated ({Len} chars).", answer.Length);
+            var toolCalls = response.Messages
+                .SelectMany(m => m.Contents.OfType<FunctionCallContent>())
+                .ToList();
 
-        return answer;
+            if (toolCalls.Count == 0)
+            {
+                _logger.LogInformation("Agentic chat completed after {Rounds} tool round(s).", round);
+                return response.Text ?? string.Empty;
+            }
+
+            _logger.LogDebug("Tool round {Round}/{Max}: executing {Count} call(s).",
+                round + 1, _maxToolRounds, toolCalls.Count);
+
+            var toolResultContents = new List<AIContent>(toolCalls.Count);
+            foreach (var toolCall in toolCalls)
+            {
+                var result = await InvokeToolSafeAsync(toolCall, cancellationToken);
+                toolResultContents.Add(new FunctionResultContent(toolCall.CallId, result));
+            }
+
+            messages.Add(new ChatMessage(ChatRole.Tool, toolResultContents));
+        }
+
+        _logger.LogWarning("MaxToolRounds ({Max}) exhausted. Requesting final answer without tools.", _maxToolRounds);
+
+        var finalResponse = await _chatClient.GetResponseAsync(messages, new ChatOptions(), cancellationToken);
+        return finalResponse.Text ?? string.Empty;
+    }
+
+    private async Task<object?> InvokeToolSafeAsync(
+        FunctionCallContent toolCall,
+        CancellationToken cancellationToken)
+    {
+        var tool = _tools.All.FirstOrDefault(t => t.Name == toolCall.Name);
+
+        if (tool is null)
+        {
+            _logger.LogWarning("Model requested unknown tool '{ToolName}'.", toolCall.Name);
+            return $"Tool '{toolCall.Name}' is not registered.";
+        }
+
+        try
+        {
+            _logger.LogDebug("Invoking tool '{ToolName}'.", toolCall.Name);
+            var args = toolCall.Arguments is not null
+                ? new AIFunctionArguments(toolCall.Arguments)
+                : new AIFunctionArguments();
+            return await tool.InvokeAsync(args, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Tool '{ToolName}' threw an exception.", toolCall.Name);
+            return $"Tool execution failed: {ex.Message}";
+        }
     }
 }

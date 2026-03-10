@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Neo4j.Driver;
 
@@ -10,15 +11,21 @@ namespace RoZwet.Tools.StoreProc.Infrastructure.Neo4j;
 internal sealed class Neo4jIndexInitializer
 {
     private const string VectorIndexName = "procedure_embeddings";
-    private const int EmbeddingDimensions = 1024;
 
     private readonly IDriver _driver;
     private readonly ILogger<Neo4jIndexInitializer> _logger;
+    private readonly int _embeddingDimensions;
 
-    public Neo4jIndexInitializer(IDriver driver, ILogger<Neo4jIndexInitializer> logger)
+    public Neo4jIndexInitializer(
+        IDriver driver,
+        IConfiguration config,
+        ILogger<Neo4jIndexInitializer> logger)
     {
         _driver = driver;
         _logger = logger;
+        _embeddingDimensions = int.TryParse(config["Ai:Embedding:Dimensions"], out var d) && d > 0
+            ? d
+            : 1024;
     }
 
     /// <summary>
@@ -26,7 +33,7 @@ internal sealed class Neo4jIndexInitializer
     /// </summary>
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("Initializing Neo4j schema...");
+        _logger.LogInformation("Initializing Neo4j schema (embedding dims={Dims})...", _embeddingDimensions);
 
         await using var session = _driver.AsyncSession();
 
@@ -64,14 +71,14 @@ internal sealed class Neo4jIndexInitializer
 
     private async Task ApplyVectorIndexAsync(IAsyncSession session, CancellationToken cancellationToken)
     {
-        // Cypher uses curly-brace syntax for OPTIONS — plain raw string avoids interpolation conflicts.
-        // Values are manifest constants: index name = "procedure_embeddings", dims = 1024.
-        const string cypher = """
+        // $$"""...""" raw string: single { } are literal Cypher braces; {{expr}} is the C# interpolation.
+        // _embeddingDimensions is a validated positive int — not user-controlled input.
+        var cypher = $$"""
             CREATE VECTOR INDEX procedure_embeddings IF NOT EXISTS
             FOR (p:Procedure) ON (p.embedding)
             OPTIONS {
               indexConfig: {
-                `vector.dimensions`: 1024,
+                `vector.dimensions`: {{_embeddingDimensions}},
                 `vector.similarity_function`: 'cosine'
               }
             }
@@ -82,7 +89,7 @@ internal sealed class Neo4jIndexInitializer
             await session.RunAsync(cypher);
             _logger.LogInformation(
                 "Vector index '{IndexName}' created (dims={Dims}, similarity=cosine).",
-                VectorIndexName, EmbeddingDimensions);
+                VectorIndexName, _embeddingDimensions);
         }
         catch (ClientException ex) when (ex.Message.Contains("already exists", StringComparison.OrdinalIgnoreCase))
         {

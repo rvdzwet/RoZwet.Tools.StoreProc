@@ -1,35 +1,47 @@
 # ACTIVE CONTEXT: RoZwet.Tools.StoreProc
 
 ## Current Operation
-**INITIAL IMPLEMENTATION — COMPLETE**
+**MIGRATION v1.1.0 — COMPLETE: Gemini 3 Flash + Voyage AI + Agentic Tool Loop**
 
 ## State
 - Phase: Production Ready
-- Started: 2026-03-10
-- Completed: 2026-03-10
+- Migration Completed: 2026-03-10
 - Status: BUILD SUCCEEDED — Zero errors, zero warnings
 
-## Completed Steps
-- [x] memory-bank/plan.md created
-- [x] memory-bank/systemPatterns.md created
-- [x] memory-bank/securityStandards.md created
-- [x] memory-bank/activeContext.md created
-- [x] .csproj upgraded to net10.0, packages pinned to available versions
-- [x] appsettings.json created with Neo4j, AI, Ingestion config
-- [x] .gitignore created (secrets + runtime state excluded)
-- [x] Domain layer: StoredProcedure, ProcedureCall, TableDependency
-- [x] Infrastructure/Parsing/TsqlFragmentVisitor.cs (TSqlFragmentVisitor)
-- [x] Infrastructure/Neo4j/Neo4jIndexInitializer.cs
-- [x] Infrastructure/Neo4j/Neo4jRepository.cs (INeo4jRepository)
-- [x] Infrastructure/Ai/EmbeddingProvider.cs
-- [x] Infrastructure/Ai/ChatProvider.cs
-- [x] Application/Contracts/INeo4jRepository.cs
-- [x] Application/Agents/SqlAnalysisAgent.cs
-- [x] Application/Pipeline/IngestionCheckpoint.cs (durable state)
-- [x] Application/Pipeline/PipelineOrchestrator.cs
-- [x] Application/Services/HybridSearchService.cs
-- [x] Application/Services/ChatService.cs
-- [x] Program.cs (DI composition root, --ingest / --chat mode router)
+## Completed Steps — v1.1.0 Migration
+- [x] appsettings.json split into `Ai:Chat` (Gemini 3 Flash) + `Ai:Embedding` (voyage-4-large) + `Ai:Agent` sections
+- [x] Program.cs — dual `OpenAIClient` registration (separate endpoints per provider)
+- [x] Neo4jIndexInitializer — embedding dimensions config-driven via `Ai:Embedding:Dimensions`
+- [x] StoredProcedure.ApplyEmbedding — removed hardcoded 1024 constraint; accepts any non-empty vector
+- [x] INeo4jRepository — 3 new methods: GetProcedureSqlAsync, ExpandCallChainAsync, GetTableUsageAsync
+- [x] Neo4jRepository — Cypher implementations for 3 new methods
+- [x] GraphQueryTools.cs (NEW) — 4 AIFunction tool definitions wrapping Neo4j graph
+- [x] ChatService — full agentic tool-calling loop (MaxToolRounds=5, AIFunctionArguments, correct API surface)
+- [x] RoZwet.Tools.StoreProc.csproj — probe/ directory excluded from main compilation glob
+
+## AI Provider Configuration (v1.1.0)
+| Role | Provider | Model | Endpoint |
+|---|---|---|---|
+| Chat / Agent | Google Gemini | `gemini-3-flash-preview` | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| Embeddings | Voyage AI | `voyage-4-large` | `https://api.voyageai.com/v1` |
+
+## Microsoft.Extensions.AI v9.5.0 — Verified API Surface
+| Element | Confirmed Signature |
+|---|---|
+| `ChatResponse.Messages` | `IList<ChatMessage>` (plural) |
+| `FunctionResultContent` ctor | `(string callId, object result)` — 2 args |
+| `FunctionCallContent.Arguments` | `IDictionary<string, object>` |
+| `AIFunction.Name` | Direct property — no `.Metadata` wrapper |
+| `AIFunction.InvokeAsync` | `(AIFunctionArguments args, CancellationToken ct)` |
+| `AIFunctionArguments` ctor | `(IDictionary<string, object>)` |
+
+## Agentic Tool Definitions (GraphQueryTools)
+| Tool Name | Description |
+|---|---|
+| `search_procedures` | Hybrid vector+graph search for semantically related procedures |
+| `get_procedure_sql` | Returns full SQL body of a named procedure |
+| `expand_call_chain` | Traverses CALLS edges up to depth N (clamped 1–5) |
+| `get_table_usage` | Returns all procedures referencing a named table |
 
 ## Package Versions (Resolved)
 | Package | Version |
@@ -41,25 +53,20 @@
 | Neo4j.Driver | 5.28.0 |
 | OpenAI | 2.8.0 |
 
-## API Corrections Applied
-| Old (Incorrect) | Correct |
-|---|---|
-| `IChatClient.CompleteAsync` | `IChatClient.GetResponseAsync` |
-| `response.Message.Text` | `response.Text` |
-| `IEmbeddingGenerator.GenerateEmbeddingAsync` | `IEmbeddingGenerator.GenerateAsync([text])` |
-| `openAiClient.AsChatClient(model)` | `openAiClient.GetChatClient(model).AsIChatClient()` |
-| `openAiClient.AsEmbeddingGenerator(model)` | `openAiClient.GetEmbeddingClient(model).AsIEmbeddingGenerator(dims: 1024)` |
-
 ## Next Steps (Operator Actions Required)
-1. Configure `appsettings.json` with real Neo4j credentials and Codestral API key
-2. Place 5,500 `.sql` files in the configured `SqlSourceDirectory` (default: `./sql`)
+1. Set real API keys in `appsettings.json`:
+   - `Ai:Chat:ApiKey` → Gemini API key from Google AI Studio
+   - `Ai:Embedding:ApiKey` → Voyage AI API key from voyageai.com
+   - `Neo4j:Password` → your Neo4j instance password
+2. Place 5,500 `.sql` files in `Ingestion:SqlSourceDirectory` (default: `./sql`)
 3. Run ingestion: `dotnet run -- --ingest`
-4. Start chat: `dotnet run -- --chat`
+4. Start agentic chat: `dotnet run -- --chat`
 
 ## Risk Register
 | Risk | Status |
 |---|---|
-| Codestral-Embed 1024-dim mismatch | MITIGATED — dims locked in index + AsIEmbeddingGenerator call |
-| Sybase-specific SQL syntax failures | MITIGATED — per-file try/catch with warning log, pipeline continues |
+| voyage-4-large dimension mismatch | MITIGATED — dims read from config, propagated to index + EmbeddingGenerator |
+| Sybase-specific SQL syntax failures | MITIGATED — per-file try/catch with warning log |
 | Neo4j vector index not available | MITIGATED — idempotent init with clear error logging |
 | Interruption during 5,500-file run | MITIGATED — checkpoint.json ensures resume from last committed batch |
+| Agentic loop runaway | MITIGATED — MaxToolRounds=5 cap, tool exceptions caught and returned as error content |

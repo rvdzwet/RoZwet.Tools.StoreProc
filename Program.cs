@@ -89,24 +89,27 @@ internal static class Program
 
     private static void RegisterAiProviders(IServiceCollection services, IConfiguration config)
     {
+        // Embedding provider: Voyage AI (voyage-4-large)
         services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(_ =>
         {
-            var endpoint       = RequireConfig(config, "Ai:Endpoint");
-            var apiKey         = RequireConfig(config, "Ai:ApiKey");
-            var embeddingModel = RequireConfig(config, "Ai:EmbeddingModel");
+            var endpoint       = RequireConfig(config, "Ai:Embedding:Endpoint");
+            var apiKey         = RequireConfig(config, "Ai:Embedding:ApiKey");
+            var embeddingModel = RequireConfig(config, "Ai:Embedding:Model");
+            var dimensions     = int.TryParse(config["Ai:Embedding:Dimensions"], out var d) && d > 0 ? d : 1024;
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(apiKey),
                 new OpenAIClientOptions { Endpoint = new Uri(endpoint) });
 
-            return openAiClient.GetEmbeddingClient(embeddingModel).AsIEmbeddingGenerator(defaultModelDimensions: 1024);
+            return openAiClient.GetEmbeddingClient(embeddingModel).AsIEmbeddingGenerator(defaultModelDimensions: dimensions);
         });
 
+        // Chat provider: Gemini 3 Flash (OpenAI-compatible endpoint)
         services.AddSingleton<IChatClient>(_ =>
         {
-            var endpoint  = RequireConfig(config, "Ai:Endpoint");
-            var apiKey    = RequireConfig(config, "Ai:ApiKey");
-            var chatModel = RequireConfig(config, "Ai:ChatModel");
+            var endpoint  = RequireConfig(config, "Ai:Chat:Endpoint");
+            var apiKey    = RequireConfig(config, "Ai:Chat:ApiKey");
+            var chatModel = RequireConfig(config, "Ai:Chat:Model");
 
             var openAiClient = new OpenAIClient(
                 new ApiKeyCredential(apiKey),
@@ -123,6 +126,7 @@ internal static class Program
     {
         services.AddSingleton<SqlAnalysisAgent>();
         services.AddSingleton<HybridSearchService>();
+        services.AddSingleton<GraphQueryTools>();
         services.AddSingleton<ChatService>();
 
         services.AddSingleton(sp =>

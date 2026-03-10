@@ -12,7 +12,6 @@ namespace RoZwet.Tools.StoreProc.Infrastructure.Neo4j;
 internal sealed class Neo4jRepository : INeo4jRepository
 {
     private const string VectorIndexName = "procedure_embeddings";
-    private const int DefaultTopK = 3;
 
     private readonly IDriver _driver;
     private readonly Neo4jIndexInitializer _indexInitializer;
@@ -116,6 +115,94 @@ internal sealed class Neo4jRepository : INeo4jRepository
         });
 
         return neighbors.AsReadOnly();
+    }
+
+    /// <inheritdoc />
+    public async Task<string?> GetProcedureSqlAsync(
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return null;
+
+        await using var session = _driver.AsyncSession();
+
+        const string cypher = """
+            MATCH (p:Procedure {name: $name})
+            RETURN p.sql AS sql
+            LIMIT 1
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { name });
+
+        string? sql = null;
+        await cursor.ForEachAsync(record =>
+        {
+            sql = record["sql"].As<string?>();
+        });
+
+        return sql;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<string>> ExpandCallChainAsync(
+        string name,
+        int depth,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name) || depth <= 0)
+            return [];
+
+        await using var session = _driver.AsyncSession();
+
+        // Neo4j path-length bounds must be integer literals — not Cypher parameters.
+        // depth is a validated positive int (not user string input) so baking it in is safe.
+        var cypher = $$"""
+            MATCH (root:Procedure {name: $name})-[:CALLS*1..{{depth}}]->(callee:Procedure)
+            RETURN DISTINCT callee.name AS calleeName
+            ORDER BY calleeName
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { name });
+
+        var chain = new List<string>();
+        await cursor.ForEachAsync(record =>
+        {
+            var callee = record["calleeName"].As<string?>();
+            if (!string.IsNullOrWhiteSpace(callee))
+                chain.Add(callee);
+        });
+
+        return chain.AsReadOnly();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<string>> GetTableUsageAsync(
+        string tableName,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            return [];
+
+        await using var session = _driver.AsyncSession();
+
+        const string cypher = """
+            MATCH (p:Procedure)-[:READS_FROM|WRITES_TO]->(t:Table {name: $tableName})
+            RETURN DISTINCT p.name AS procName
+            ORDER BY procName
+            """;
+
+        var cursor = await session.RunAsync(cypher, new { tableName });
+
+        var procedures = new List<string>();
+        await cursor.ForEachAsync(record =>
+        {
+            var proc = record["procName"].As<string?>();
+            if (!string.IsNullOrWhiteSpace(proc))
+                procedures.Add(proc);
+        });
+
+        return procedures.AsReadOnly();
     }
 
     private static async Task UpsertProcedureNodeAsync(IAsyncQueryRunner tx, StoredProcedure proc)

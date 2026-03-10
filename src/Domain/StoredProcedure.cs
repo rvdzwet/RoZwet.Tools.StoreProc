@@ -46,8 +46,8 @@ public sealed class StoredProcedure
     /// </summary>
     public void ApplyEmbedding(float[] embedding)
     {
-        if (embedding.Length != 1024)
-            throw new ArgumentException($"Expected 1024-dimensional embedding, received {embedding.Length}.", nameof(embedding));
+        if (embedding.Length == 0)
+            throw new ArgumentException("Embedding vector cannot be empty.", nameof(embedding));
 
         Embedding = embedding;
     }

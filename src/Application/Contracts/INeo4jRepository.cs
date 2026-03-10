@@ -32,11 +32,36 @@ public interface INeo4jRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Expands the search context by fetching 1-hop neighbors (CALLS / READS_FROM) 
+    /// Expands the search context by fetching 1-hop neighbors (CALLS / READS_FROM)
     /// for a set of procedure names.
     /// </summary>
     Task<IReadOnlyList<string>> ExpandNeighborsAsync(
         IReadOnlyList<string> procedureNames,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns the full SQL body of a stored procedure identified by its exact name.
+    /// Returns <see langword="null"/> when the procedure is not found in the graph.
+    /// </summary>
+    Task<string?> GetProcedureSqlAsync(
+        string name,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Traverses CALLS relationships up to <paramref name="depth"/> hops and returns
+    /// the distinct names of all procedures reachable from <paramref name="name"/>.
+    /// </summary>
+    Task<IReadOnlyList<string>> ExpandCallChainAsync(
+        string name,
+        int depth,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns the names of all procedures that reference the given table
+    /// via READS_FROM or WRITES_TO relationships.
+    /// </summary>
+    Task<IReadOnlyList<string>> GetTableUsageAsync(
+        string tableName,
         CancellationToken cancellationToken = default);
 }
 

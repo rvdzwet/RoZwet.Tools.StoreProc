@@ -39,4 +39,9 @@
     </None>
   </ItemGroup>
 
+  <!-- Exclude the reflection probe sub-project from main compilation -->
+  <ItemGroup>
+    <Compile Remove="probe/**/*.cs" />
+  </ItemGroup>
+
 </Project>
